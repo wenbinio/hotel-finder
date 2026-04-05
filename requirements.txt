@@ -1,5 +1,7 @@
 flask==3.1.3
+flask-cors>=4.0.0
 fast-hotels==0.2.1
 selectolax>=0.4.0
 primp>=1.2.0
+requests>=2.31.0
 gunicorn==23.0.0
