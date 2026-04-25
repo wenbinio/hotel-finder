@@ -74,6 +74,80 @@ DISQUALIFIERS = ["villa", "hostel", "guesthouse", "guest house", "homestay",
                  "apartment", "dormitory", "capsule", "backpacker"]
 
 
+# ── Globalization: currency symbols and defaults ──────────────────────────────
+# Map ISO 4217 currency code → most common display symbol returned by Google.
+# Used to build a dynamic price-extraction regex per currency.
+CURRENCY_SYMBOLS = {
+    "USD": "$",  "EUR": "€",  "GBP": "£",  "JPY": "¥",  "CNY": "¥",
+    "INR": "₹",  "THB": "฿",  "AUD": "A$", "CAD": "C$", "SGD": "S$",
+    "MYR": "RM", "IDR": "Rp", "VND": "₫",  "KRW": "₩",  "HKD": "HK$",
+    "TWD": "NT$","PHP": "₱",  "CHF": "CHF","NZD": "NZ$","BRL": "R$",
+    "MXN": "MX$","ZAR": "R",  "TRY": "₺",  "RUB": "₽",  "AED": "AED",
+    "SAR": "SAR","ILS": "₪",  "PLN": "zł", "SEK": "kr", "NOK": "kr",
+    "DKK": "kr", "CZK": "Kč",
+}
+
+# Sensible default upper bound on hotel prices, in USD. The /api/search caller
+# may pass a ``maxPrice`` to override this for high-currency markets (e.g. JPY,
+# IDR, VND) or to widen the budget.
+DEFAULT_MAX_PRICE_USD = 1500
+
+
+def _currency_price_re(currency: str) -> "re.Pattern[str]":
+    """Build a regex matching prices in the given currency.
+
+    Matches the currency symbol (or ISO code) optionally followed by whitespace
+    and a number. Also matches JS-escaped single-char symbols (\\xNN, \\uNNNN)
+    used by Google's embedded JSON when applicable.
+    """
+    cur = (currency or "USD").upper()
+    symbol = CURRENCY_SYMBOLS.get(cur, cur)
+    alts = {re.escape(symbol), re.escape(cur)}
+    if len(symbol) == 1:
+        cp = ord(symbol)
+        alts.add(rf"\\x{cp:02x}")
+        alts.add(rf"\\u{cp:04x}")
+    prefix = "(?:" + "|".join(sorted(alts, key=len, reverse=True)) + ")"
+    # Capture digits separated by , . or  (NBSP/thin space) — Google formats
+    # vary by locale (1,234.56 vs 1.234,56 vs 1 234,56).
+    return re.compile(prefix + r"\s?([0-9][0-9.,   ]*)")
+
+
+def _parse_localized_number(raw: str) -> "float | None":
+    """Parse a number that may use either ``1,234.56`` or ``1.234,56`` formats."""
+    s = raw.strip().replace(" ", "").replace(" ", "").replace(" ", "")
+    if not s:
+        return None
+    n_dots = s.count(".")
+    n_commas = s.count(",")
+    if n_dots == 0 and n_commas == 0:
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    if n_dots > 0 and n_commas > 0:
+        # Whichever separator appears LAST is the decimal separator.
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        # Only one type of separator. Treat as thousands separator if it
+        # appears multiple times, or if exactly 3 digits follow it (since
+        # currencies almost always use 0-2 fractional digits).
+        sep = "." if n_dots > 0 else ","
+        count = n_dots if n_dots > 0 else n_commas
+        after = s.rsplit(sep, 1)[1]
+        if count > 1 or len(after) == 3:
+            s = s.replace(sep, "")
+        elif sep == ",":
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def brand_star_class(name: str) -> int | None:
     """Return the star class if the hotel name matches a known luxury brand, else None."""
     nl = name.lower()
@@ -126,24 +200,71 @@ for cat in DESTINATIONS.values():
 
 
 # ── Hotel search ──────────────────────────────────────────────────────────────
-def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5) -> list[dict]:
-    """Search Google Hotels for hotels at or above the given star class."""
+def _category_for(location: str, custom_categories: "dict | None" = None) -> str:
+    """Return the destination category for a location.
+
+    ``custom_categories`` is a {location_name: category_name} map supplied by
+    the caller, used when the request includes user-defined destinations.
+    Falls back to the built-in DESTINATIONS table, then to ``"other"``.
+    """
+    if custom_categories and location in custom_categories:
+        return custom_categories[location]
+    for cat, dlist in DESTINATIONS.items():
+        if any(d["name"] == location for d in dlist):
+            return cat
+    return "other"
+
+
+def search_hotels(
+    location: str,
+    checkin: str,
+    checkout: str,
+    min_stars: int = 5,
+    language: str = "en",
+    currency: str = "USD",
+    region: "str | None" = None,
+    max_price: "float | None" = None,
+    category_map: "dict | None" = None,
+    flight_cost: "float | None" = None,
+) -> list[dict]:
+    """Search Google Hotels for hotels at or above the given star class.
+
+    ``language``/``currency``/``region`` are forwarded to Google as ``hl``,
+    ``curr`` and ``gl`` so the same backend can serve any market.
+    ``max_price`` is in the requested currency; defaults vary by currency.
+    """
     hotel_data = [HotelData(checkin_date=checkin, checkout_date=checkout, location=location)]
     guests = Guests(adults=1)
     ths = THSData.from_interface(hotel_data=hotel_data, guests=guests, room_type="standard")
     data = ths.as_b64()
     params = {
         "ths": data.decode("utf-8"),
-        "hl": "en",
-        "curr": "USD",
+        "hl": language or "en",
+        "curr": (currency or "USD").upper(),
         "q": f"{min_stars} star hotels {location}",
     }
+    if region:
+        params["gl"] = region
     client = Client(impersonate="chrome_126", verify=False)
     city = location.strip().replace(" ", "+").lower()
     url = f"https://www.google.com/travel/hotels/{city}"
     res = client.get(url, params=params)
     if res.status_code != 200:
         return []
+
+    price_re = _currency_price_re(currency)
+    # In USD, prices over 1500 are likely junk; in JPY/IDR/VND that ceiling is
+    # ridiculously low. Caller can override; otherwise pick a sensible default.
+    if max_price is None:
+        max_price = DEFAULT_MAX_PRICE_USD
+        # Rough multiplier for high-denomination currencies
+        scale = {
+            "JPY": 150, "KRW": 1300, "IDR": 15000, "VND": 25000,
+            "INR": 85, "THB": 35, "PHP": 55, "TWD": 30, "HUF": 350,
+            "RUB": 90,
+        }.get((currency or "USD").upper())
+        if scale:
+            max_price = DEFAULT_MAX_PRICE_USD * scale
 
     parser = LexborHTMLParser(res.text)
     hotels = []
@@ -156,15 +277,17 @@ def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5
         review_rating = None
         re_elem = card.css_first("span.KFi5wf.lA0BZ")
         if re_elem:
-            try:
-                review_rating = float(re_elem.text(strip=True))
-            except ValueError:
-                pass
+            num = _parse_localized_number(re_elem.text(strip=True))
+            if num is not None:
+                review_rating = num
 
-        # Extract star class from Google's HTML tag
+        # Extract star class from Google's HTML tag. The label is localized
+        # ("5-star hotel" / "Hôtel 5 étoiles" / "5성급 호텔" / ...), so we just
+        # grab the first 1–5 digit appearing in the label.
         html_star_class = None
         for span in card.css("span.ne5qie.Ih19Ad"):
-            m = re.match(r"(\d)-star", span.text(strip=True))
+            txt = span.text(strip=True)
+            m = re.search(r"([1-5])", txt)
             if m:
                 html_star_class = int(m.group(1))
                 break
@@ -185,21 +308,16 @@ def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5
             if elems:
                 amenities = [e.text(strip=True) for e in elems if e.text(strip=True) and len(e.text(strip=True)) > 2]
                 break
-        if not amenities:
-            ct = card.text()
-            known_a = ["Free Wi-Fi", "Pool", "Spa", "Restaurant", "Fitness",
-                        "Bar", "Breakfast", "Beach", "Airport shuttle", "Kid-friendly", "Gym"]
-            amenities = [a for a in known_a if a.lower() in ct.lower()]
+        # Note: amenity fallback by keyword is intentionally omitted — the
+        # keywords would be locale-specific and Google already returns
+        # localized amenity chips in the selectors above.
 
         price = None
         ct = card.text()
-        pm = re.findall(r"\$([0-9,]+)", ct)
+        pm = price_re.findall(ct)
         if pm:
-            try:
-                price = float(pm[0].replace(",", ""))
-            except ValueError:
-                pass
-        if price is None or price > 1500:
+            price = _parse_localized_number(pm[0])
+        if price is None or price > max_price:
             continue
 
         link_url = None
@@ -211,6 +329,7 @@ def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5
         hotels.append({
             "name": name,
             "price": price,
+            "currency": (currency or "USD").upper(),
             "rating": review_rating,
             "star_class": star_class,
             "confirmation": "html" if html_star_class else "brand",
@@ -219,23 +338,27 @@ def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5
             "location": location,
             "checkin": checkin,
             "checkout": checkout,
-            "category": "beachfront" if location in [d["name"] for d in DESTINATIONS["beachfront"]] else "non_beachfront",
-            "flight_cost": FLIGHT_BUDGET_MAP.get(location, 0),
+            "category": _category_for(location, category_map),
+            "flight_cost": flight_cost if flight_cost is not None else FLIGHT_BUDGET_MAP.get(location, 0),
         })
 
     hotels.sort(key=lambda h: h["price"])
     return hotels
 
 
-def fetch_provider_prices(entity_url):
+def fetch_provider_prices(entity_url, language: str = "en", currency: str = "USD"):
     """Fetch a Google Hotels entity page and extract prices from all booking providers."""
     try:
         client = Client(impersonate="chrome_126", verify=False)
-        res = client.get(entity_url, params={"hl": "en", "curr": "USD"})
+        res = client.get(entity_url, params={
+            "hl": language or "en",
+            "curr": (currency or "USD").upper(),
+        })
         if res.status_code != 200:
             return {}
 
         html = res.text
+        price_re = _currency_price_re(currency)
         providers_found = {}
         provider_names = [
             ("Trip.com", "trip.com"),
@@ -252,11 +375,10 @@ def fetch_provider_prices(entity_url):
                 start = max(0, m.start() - 300)
                 end = min(len(html), m.end() + 300)
                 chunk = html[start:end]
-                # Google encodes $ as \x24 or \u0024 in its JS data
-                prices = re.findall(r"(?:\\x24|\\u0024|\$)(\d+)", chunk)
+                prices = price_re.findall(chunk)
                 if prices:
-                    price = float(prices[0])
-                    if 10 < price < 2000:
+                    price = _parse_localized_number(prices[0])
+                    if price is not None and 10 < price < 200000:
                         if key not in providers_found or price < providers_found[key]:
                             providers_found[key] = price
                     break
@@ -266,6 +388,48 @@ def fetch_provider_prices(entity_url):
 
 
 # ── API Routes ────────────────────────────────────────────────────────────────
+
+def _locale_params(data: dict) -> dict:
+    """Extract globalization params (language/currency/region) from a request body.
+
+    Defaults to en/USD/none for backwards compatibility.
+    """
+    return {
+        "language": (data.get("language") or "en"),
+        "currency": (data.get("currency") or "USD").upper(),
+        "region": data.get("region") or None,
+    }
+
+
+def _resolve_destinations(data: dict) -> "tuple[dict, dict, dict]":
+    """Resolve which destinations to search.
+
+    Returns (destinations_by_category, flight_budget_map, category_map).
+    If the caller passes ``customDestinations`` (a list of {name, airport,
+    flight_usd, category}), those replace the built-in SE Asia table — so the
+    backend can be used anywhere in the world.
+    """
+    custom = data.get("customDestinations")
+    if not custom:
+        return DESTINATIONS, FLIGHT_BUDGET_MAP, {}
+    by_cat: dict[str, list[dict]] = {}
+    flight_map: dict[str, float] = {}
+    cat_map: dict[str, str] = {}
+    for d in custom:
+        name = d.get("name")
+        if not name:
+            continue
+        cat = d.get("category", "other")
+        flight_usd = d.get("flight_usd", 0)
+        by_cat.setdefault(cat, []).append({
+            "name": name,
+            "airport": d.get("airport", ""),
+            "flight_usd": flight_usd,
+        })
+        flight_map[name] = flight_usd
+        cat_map[name] = cat
+    return by_cat, flight_map, cat_map
+
 
 @app.route("/api/destinations", methods=["GET"])
 def get_destinations():
@@ -280,9 +444,20 @@ def api_search():
     checkin = data.get("checkin", "2026-06-15")
     checkout = data.get("checkout", "2026-06-16")
     min_stars = data.get("minStars", 5)
+    locale = _locale_params(data)
+    max_price = data.get("maxPrice")
     try:
-        hotels = search_hotels(location, checkin, checkout, min_stars=min_stars)
-        return jsonify({"location": location, "checkin": checkin, "hotels": hotels})
+        hotels = search_hotels(
+            location, checkin, checkout, min_stars=min_stars,
+            max_price=max_price, **locale,
+        )
+        return jsonify({
+            "location": location,
+            "checkin": checkin,
+            "hotels": hotels,
+            "currency": locale["currency"],
+            "language": locale["language"],
+        })
     except Exception as e:
         return jsonify({"error": str(e), "location": location}), 500
 
@@ -296,42 +471,56 @@ def api_search_all():
     max_flight = data.get("maxFlight", 300)
     min_stars = data.get("minStars", 5)
     destinations = data.get("destinations", None)
+    locale = _locale_params(data)
+    max_price = data.get("maxPrice")
+    dests_by_cat, flight_map, cat_map = _resolve_destinations(data)
 
     # Collect all destinations within flight budget
     all_dests = []
-    for cat, dlist in DESTINATIONS.items():
+    dest_to_cat: dict[str, str] = {}
+    for cat, dlist in dests_by_cat.items():
         for d in dlist:
-            if d["flight_usd"] <= max_flight:
+            if d.get("flight_usd", 0) <= max_flight:
                 if destinations is None or d["name"] in destinations:
                     all_dests.append(d)
+                    dest_to_cat[d["name"]] = cat
 
-    results = {"beachfront": [], "non_beachfront": []}
+    results: dict[str, list] = {cat: [] for cat in dests_by_cat.keys()}
 
     def search_dest(d):
         try:
-            hotels = search_hotels(d["name"], checkin, checkout, min_stars=min_stars)
+            hotels = search_hotels(
+                d["name"], checkin, checkout, min_stars=min_stars,
+                max_price=max_price, category_map=cat_map or None,
+                flight_cost=d.get("flight_usd", 0), **locale,
+            )
             time.sleep(0.3)
             return d, hotels
-        except Exception as e:
+        except Exception:
             return d, []
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(search_dest, d): d for d in all_dests}
         for future in as_completed(futures):
             d, hotels = future.result()
-            cat = "beachfront" if d in DESTINATIONS["beachfront"] else "non_beachfront"
-            results[cat].extend(hotels)
+            cat = dest_to_cat.get(d["name"], "other")
+            results.setdefault(cat, []).extend(hotels)
 
-    results["beachfront"].sort(key=lambda h: h["price"])
-    results["non_beachfront"].sort(key=lambda h: h["price"])
+    for cat_list in results.values():
+        cat_list.sort(key=lambda h: h["price"])
 
+    totals = {f"total_{cat}": len(items) for cat, items in results.items()}
+    # Back-compat shortcuts for the existing default categories
     return jsonify({
         "checkin": checkin,
         "checkout": checkout,
         "maxFlight": max_flight,
+        "currency": locale["currency"],
+        "language": locale["language"],
         "results": results,
-        "totalBeachfront": len(results["beachfront"]),
-        "totalNonBeachfront": len(results["non_beachfront"]),
+        "totals": totals,
+        "totalBeachfront": len(results.get("beachfront", [])),
+        "totalNonBeachfront": len(results.get("non_beachfront", [])),
     })
 
 
@@ -354,11 +543,14 @@ def api_cheapest_dates():
     nights = data.get("nights", 1)
     sample_count = data.get("sampleCount", 8)
     min_stars = data.get("minStars", 5)
+    locale = _locale_params(data)
+    max_price = data.get("maxPrice")
+    dests_by_cat, _flight_map, cat_map = _resolve_destinations(data)
 
     if locations and len(locations) >= 1:
         dest_names = locations
     else:
-        dest_names = [d["name"] for cat in DESTINATIONS.values() for d in cat]
+        dest_names = [d["name"] for cat in dests_by_cat.values() for d in cat]
 
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
@@ -398,7 +590,11 @@ def api_cheapest_dates():
                 sweep_progress["current_dest"] = loc
                 sweep_progress["dests_done"] = i
             try:
-                hotels = search_hotels(loc, ci, co, min_stars=min_stars)
+                hotels = search_hotels(
+                    loc, ci, co, min_stars=min_stars,
+                    max_price=max_price, category_map=cat_map or None,
+                    **locale,
+                )
                 all_hotels.extend(hotels)
             except Exception:
                 pass
@@ -435,11 +631,11 @@ def api_cheapest_dates():
     valid = [r for r in date_results if r["cheapest_price"] is not None]
     cheapest_entry = min(valid, key=lambda r: r["cheapest_price"], default=None)
 
-    best_date_hotels = {"beachfront": [], "non_beachfront": []}
+    best_date_hotels: dict[str, list] = {cat: [] for cat in dests_by_cat.keys()}
     if cheapest_entry:
         for h in cheapest_entry["all_hotels"]:
-            cat = h.get("category", "non_beachfront")
-            best_date_hotels[cat].append(h)
+            cat = h.get("category", "other")
+            best_date_hotels.setdefault(cat, []).append(h)
 
     for r in date_results:
         r.pop("all_hotels", None)
@@ -454,6 +650,8 @@ def api_cheapest_dates():
         "location": dest_names[0] if len(dest_names) == 1 else None,
         "dateRange": {"start": start_date, "end": end_date},
         "nights": nights,
+        "currency": locale["currency"],
+        "language": locale["language"],
         "dates": date_results,
         "cheapestDate": {
             "checkin": cheapest_entry["checkin"],
@@ -463,8 +661,9 @@ def api_cheapest_dates():
             "location": cheapest_entry["location"],
         } if cheapest_entry else None,
         "bestDateResults": best_date_hotels,
-        "totalBeachfront": len(best_date_hotels["beachfront"]),
-        "totalNonBeachfront": len(best_date_hotels["non_beachfront"]),
+        "totals": {f"total_{cat}": len(items) for cat, items in best_date_hotels.items()},
+        "totalBeachfront": len(best_date_hotels.get("beachfront", [])),
+        "totalNonBeachfront": len(best_date_hotels.get("non_beachfront", [])),
     })
 
 
@@ -488,24 +687,36 @@ def resolve_tripadvisor_key(hotel_name, location=""):
     return None
 
 
-def _ota_search_url(provider_code, hotel_name, checkin, checkout):
-    """Construct a search URL for the given OTA pre-filled with hotel + dates."""
+def _ota_search_url(provider_code, hotel_name, checkin, checkout,
+                    language: str = "en", region: "str | None" = None,
+                    currency: str = "USD"):
+    """Construct a search URL for the given OTA pre-filled with hotel + dates.
+
+    ``language``/``region`` produce locale tags such as ``en-sg`` or ``de-de``
+    used by Traveloka and other OTAs that require them. ``currency`` is passed
+    where supported.
+    """
     from urllib.parse import quote_plus
     q = quote_plus(hotel_name)
+    lang = (language or "en").lower()
+    reg = (region or "us").lower()
+    locale = f"{lang}-{reg}"
+    cur = (currency or "USD").upper()
     urls = {
-        "BookingCom":  f"https://www.booking.com/searchresults.html?ss={q}&checkin={checkin}&checkout={checkout}",
-        "Agoda":       f"https://www.agoda.com/search?q={q}&checkIn={checkin}&los=1",
-        "CtripTA":     f"https://www.trip.com/hotels/list?keyword={q}&checkIn={checkin}&checkOut={checkout}",
-        "Expedia":     f"https://www.expedia.com/Hotel-Search?destination={q}&startDate={checkin}&endDate={checkout}",
-        "HotelsCom":   f"https://www.hotels.com/search.do?q-destination={q}&q-check-in={checkin}&q-check-out={checkout}",
-        "Traveloka":   f"https://www.traveloka.com/en-sg/hotel/search?spec={checkin}.{checkout}.1.0.HOTEL_GEO.{q}",
-        "VioTA":       f"https://www.vio.com/Hotels/Search?q={q}&checkin={checkin}&checkout={checkout}",
-        "Vio":         f"https://www.vio.com/Hotels/Search?q={q}&checkin={checkin}&checkout={checkout}",
+        "BookingCom":  f"https://www.booking.com/searchresults.html?ss={q}&checkin={checkin}&checkout={checkout}&selected_currency={cur}&lang={lang}",
+        "Agoda":       f"https://www.agoda.com/search?q={q}&checkIn={checkin}&los=1&currency={cur}&locale={locale}",
+        "CtripTA":     f"https://www.trip.com/hotels/list?keyword={q}&checkIn={checkin}&checkOut={checkout}&curr={cur}&locale={locale}",
+        "Expedia":     f"https://www.expedia.com/Hotel-Search?destination={q}&startDate={checkin}&endDate={checkout}&currency={cur}&langid={lang}",
+        "HotelsCom":   f"https://www.hotels.com/search.do?q-destination={q}&q-check-in={checkin}&q-check-out={checkout}&currency={cur}&locale={locale}",
+        "Traveloka":   f"https://www.traveloka.com/{locale}/hotel/search?spec={checkin}.{checkout}.1.0.HOTEL_GEO.{q}",
+        "VioTA":       f"https://www.vio.com/Hotels/Search?q={q}&checkin={checkin}&checkout={checkout}&currency={cur}",
+        "Vio":         f"https://www.vio.com/Hotels/Search?q={q}&checkin={checkin}&checkout={checkout}&currency={cur}",
     }
     return urls.get(provider_code, "")
 
 
-def fetch_xotelo_prices(hotel_key, hotel_name, checkin, checkout, currency="USD"):
+def fetch_xotelo_prices(hotel_key, hotel_name, checkin, checkout, currency="USD",
+                        language: str = "en", region: "str | None" = None):
     """Fetch per-OTA prices + booking links from the free Xotelo API."""
     try:
         import requests as req
@@ -513,7 +724,7 @@ def fetch_xotelo_prices(hotel_key, hotel_name, checkin, checkout, currency="USD"
             "hotel_key": hotel_key,
             "chk_in": checkin,
             "chk_out": checkout,
-            "currency": currency,
+            "currency": (currency or "USD").upper(),
         }, timeout=12)
         if res.status_code != 200:
             return {}
@@ -522,7 +733,10 @@ def fetch_xotelo_prices(hotel_key, hotel_name, checkin, checkout, currency="USD"
         result = {}
         for r in rates:
             if r.get("rate"):
-                url = _ota_search_url(r.get("code", ""), hotel_name, checkin, checkout)
+                url = _ota_search_url(
+                    r.get("code", ""), hotel_name, checkin, checkout,
+                    language=language, region=region, currency=currency,
+                )
                 result[r["name"]] = {"rate": r["rate"], "tax": r.get("tax", 0), "url": url}
         return result
     except Exception:
@@ -536,6 +750,7 @@ def api_compare_prices():
     hotels = data.get("hotels", [])
     checkin = data.get("checkin", "2026-06-15")
     checkout = data.get("checkout", "2026-06-16")
+    locale = _locale_params(data)
     enriched = []
 
     def enrich(h):
@@ -544,7 +759,11 @@ def api_compare_prices():
 
         # Source 1: Google Hotels entity page
         if h.get("url"):
-            providers = fetch_provider_prices(h["url"])
+            providers = fetch_provider_prices(
+                h["url"],
+                language=locale["language"],
+                currency=locale["currency"],
+            )
             time.sleep(0.2)
 
         # Source 2: Xotelo API (needs TripAdvisor key lookup)
@@ -552,7 +771,12 @@ def api_compare_prices():
         if ta_key:
             ci = h.get("checkin", checkin)
             co = h.get("checkout", checkout)
-            xotelo = fetch_xotelo_prices(ta_key, ci, co)
+            xotelo = fetch_xotelo_prices(
+                ta_key, h.get("name", ""), ci, co,
+                currency=locale["currency"],
+                language=locale["language"],
+                region=locale["region"],
+            )
             time.sleep(0.2)
 
         # Merge: Xotelo returns {name: {rate, tax, url}}, Google returns {name: price}
@@ -592,7 +816,11 @@ def api_compare_prices():
             enriched.append(f.result())
 
     enriched.sort(key=lambda h: h.get("price", 9999))
-    return jsonify({"hotels": enriched})
+    return jsonify({
+        "hotels": enriched,
+        "currency": locale["currency"],
+        "language": locale["language"],
+    })
 
 
 @app.route("/")
