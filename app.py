@@ -96,21 +96,40 @@ DEFAULT_MAX_PRICE_USD = 1500
 def _currency_price_re(currency: str) -> "re.Pattern[str]":
     """Build a regex matching prices in the given currency.
 
-    Matches the currency symbol (or ISO code) optionally followed by whitespace
-    and a number. Also matches JS-escaped single-char symbols (\\xNN, \\uNNNN)
-    used by Google's embedded JSON when applicable.
+    Matches the currency symbol (or ISO code) on either side of the number
+    (``€100`` or ``100 €``). Also matches JS-escaped single-char symbols
+    (``\\xNN``, ``\\uNNNN``) used by Google's embedded JSON when applicable.
+    The captured group always ends in a digit, so trailing punctuation never
+    leaks into the result.
     """
     cur = (currency or "USD").upper()
     symbol = CURRENCY_SYMBOLS.get(cur, cur)
     alts = {re.escape(symbol), re.escape(cur)}
+    # Many $-suffix currencies (AUD/CAD/SGD/HKD/NZD/MXN/BRL/NT$) are rendered
+    # by Google as a bare ``$`` once the ``curr`` parameter sets the context.
+    # Accept the bare symbol too, otherwise we'd extract zero prices.
+    if "$" in symbol and symbol != "$":
+        alts.add(re.escape("$"))
     if len(symbol) == 1:
         cp = ord(symbol)
         alts.add(rf"\\x{cp:02x}")
         alts.add(rf"\\u{cp:04x}")
-    prefix = "(?:" + "|".join(sorted(alts, key=len, reverse=True)) + ")"
-    # Capture digits separated by , . or  (NBSP/thin space) — Google formats
-    # vary by locale (1,234.56 vs 1.234,56 vs 1 234,56).
-    return re.compile(prefix + r"\s?([0-9][0-9.,   ]*)")
+    sym = "(?:" + "|".join(sorted(alts, key=len, reverse=True)) + ")"
+    # Number: starts and ends with a digit; may contain digit-grouping
+    # separators ``,`` ``.`` and locale spaces in the middle.
+    num = r"([0-9](?:[0-9.,   ]*[0-9])?)"
+    # Match symbol on EITHER side of the number — Google renders prefix in
+    # most locales (en-US: ``$100``) and postfix in others (de-DE: ``100 €``).
+    return re.compile(rf"(?:{sym}\s?{num})|(?:{num}\s?{sym})")
+
+
+def _extract_price(text: str, currency: str) -> "float | None":
+    """Return the first numeric price for ``currency`` found in ``text``."""
+    m = _currency_price_re(currency).search(text)
+    if not m:
+        return None
+    raw = m.group(1) or m.group(2)
+    return _parse_localized_number(raw) if raw else None
 
 
 def _parse_localized_number(raw: str) -> "float | None":
@@ -252,7 +271,6 @@ def search_hotels(
     if res.status_code != 200:
         return []
 
-    price_re = _currency_price_re(currency)
     # In USD, prices over 1500 are likely junk; in JPY/IDR/VND that ceiling is
     # ridiculously low. Caller can override; otherwise pick a sensible default.
     if max_price is None:
@@ -312,11 +330,7 @@ def search_hotels(
         # keywords would be locale-specific and Google already returns
         # localized amenity chips in the selectors above.
 
-        price = None
-        ct = card.text()
-        pm = price_re.findall(ct)
-        if pm:
-            price = _parse_localized_number(pm[0])
+        price = _extract_price(card.text(), currency)
         if price is None or price > max_price:
             continue
 
@@ -358,7 +372,6 @@ def fetch_provider_prices(entity_url, language: str = "en", currency: str = "USD
             return {}
 
         html = res.text
-        price_re = _currency_price_re(currency)
         providers_found = {}
         provider_names = [
             ("Trip.com", "trip.com"),
@@ -375,10 +388,9 @@ def fetch_provider_prices(entity_url, language: str = "en", currency: str = "USD
                 start = max(0, m.start() - 300)
                 end = min(len(html), m.end() + 300)
                 chunk = html[start:end]
-                prices = price_re.findall(chunk)
-                if prices:
-                    price = _parse_localized_number(prices[0])
-                    if price is not None and 10 < price < 200000:
+                price = _extract_price(chunk, currency)
+                if price is not None:
+                    if 10 < price < 200000:
                         if key not in providers_found or price < providers_found[key]:
                             providers_found[key] = price
                     break
@@ -545,7 +557,7 @@ def api_cheapest_dates():
     min_stars = data.get("minStars", 5)
     locale = _locale_params(data)
     max_price = data.get("maxPrice")
-    dests_by_cat, _flight_map, cat_map = _resolve_destinations(data)
+    dests_by_cat, flight_map, cat_map = _resolve_destinations(data)
 
     if locations and len(locations) >= 1:
         dest_names = locations
@@ -593,6 +605,7 @@ def api_cheapest_dates():
                 hotels = search_hotels(
                     loc, ci, co, min_stars=min_stars,
                     max_price=max_price, category_map=cat_map or None,
+                    flight_cost=flight_map.get(loc),
                     **locale,
                 )
                 all_hotels.extend(hotels)
