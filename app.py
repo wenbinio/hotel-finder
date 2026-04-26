@@ -40,146 +40,65 @@ else:
     app = Flask(__name__)
 CORS(app)
 
-# ── Known luxury brands (must START with or BE the brand, not just contain it) ──
-# Format: (brand_prefix, min_star_class)
-# These are checked: hotel name must START WITH the brand or brand must be a
-# standalone word boundary match (not a substring of "villa" or "guesthouse")
-LUXURY_BRANDS = {
-    5: [
-        "jw marriott", "ritz-carlton", "ritz carlton", "st. regis", "st regis",
-        "w hotel", "luxury collection", "edition hotel",
-        "waldorf astoria", "conrad",
-        "sofitel", "fairmont", "raffles",
-        "park hyatt", "grand hyatt", "andaz", "alila",
-        "intercontinental", "regent", "kimpton", "six senses",
-        "mandarin oriental", "aman ", "banyan tree", "shangri-la",
-        "shangri la", "four seasons", "capella", "rosewood",
-        "taj hotel", "taj resort", "oberoi",
-        "anantara", "dusit thani", "kempinski",
-    ],
-    4: [
-        "le meridien", "le méridien", "westin", "autograph collection",
-        "hilton ", "pullman ", "mgallery", "movenpick", "mövenpick",
-        "novotel", "avani", "centara grand", "vinpearl",
-        "cinnamon grand", "cinnamon life",
-        "grand mercure", "sheraton ", "marriott ", "hyatt regency",
-        "crowne plaza", "renaissance ", "doubletree", "wyndham grand",
-        "wyndham ", "melia ", "mélia ", "four points", "oakwood premier",
-        "courtyard by marriott", "sokha",
-    ],
-}
 
-# Words that disqualify a brand match (it's a villa/hostel/guesthouse, not the chain)
-DISQUALIFIERS = ["villa", "hostel", "guesthouse", "guest house", "homestay",
-                 "apartment", "dormitory", "capsule", "backpacker"]
+# ── TTL cache ─────────────────────────────────────────────────────────────────
+# Hotel results don't change second-to-second, but the same (location, dates,
+# currency) tuple gets queried dozens of times within a single sweep and
+# repeatedly across users. A short-lived in-memory cache cuts request volume,
+# trims wall time, and reduces our chance of getting rate-limited by Google.
+SEARCH_CACHE_TTL = int(os.environ.get("SEARCH_CACHE_TTL", "600"))   # 10 minutes
+PROVIDER_CACHE_TTL = int(os.environ.get("PROVIDER_CACHE_TTL", "600"))
+XOTELO_CACHE_TTL = int(os.environ.get("XOTELO_CACHE_TTL", "1800"))  # 30 minutes
 
 
-# ── Globalization: currency symbols and defaults ──────────────────────────────
-# Map ISO 4217 currency code → most common display symbol returned by Google.
-# Used to build a dynamic price-extraction regex per currency.
-CURRENCY_SYMBOLS = {
-    "USD": "$",  "EUR": "€",  "GBP": "£",  "JPY": "¥",  "CNY": "¥",
-    "INR": "₹",  "THB": "฿",  "AUD": "A$", "CAD": "C$", "SGD": "S$",
-    "MYR": "RM", "IDR": "Rp", "VND": "₫",  "KRW": "₩",  "HKD": "HK$",
-    "TWD": "NT$","PHP": "₱",  "CHF": "CHF","NZD": "NZ$","BRL": "R$",
-    "MXN": "MX$","ZAR": "R",  "TRY": "₺",  "RUB": "₽",  "AED": "AED",
-    "SAR": "SAR","ILS": "₪",  "PLN": "zł", "SEK": "kr", "NOK": "kr",
-    "DKK": "kr", "CZK": "Kč",
-}
+class _TTLCache:
+    """Tiny thread-safe TTL cache. Not LRU — entries simply expire."""
+    def __init__(self, ttl: int, max_size: int = 1024):
+        self.ttl = ttl
+        self.max_size = max_size
+        self._data: dict = {}
+        self._lock = threading.Lock()
 
-# Sensible default upper bound on hotel prices, in USD. The /api/search caller
-# may pass a ``maxPrice`` to override this for high-currency markets (e.g. JPY,
-# IDR, VND) or to widen the budget.
-DEFAULT_MAX_PRICE_USD = 1500
+    def get(self, key):
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            expires_at, value = entry
+            if expires_at < time.time():
+                self._data.pop(key, None)
+                return None
+            return value
 
-
-def _currency_price_re(currency: str) -> "re.Pattern[str]":
-    """Build a regex matching prices in the given currency.
-
-    Matches the currency symbol (or ISO code) on either side of the number
-    (``€100`` or ``100 €``). Also matches JS-escaped single-char symbols
-    (``\\xNN``, ``\\uNNNN``) used by Google's embedded JSON when applicable.
-    The captured group always ends in a digit, so trailing punctuation never
-    leaks into the result.
-    """
-    cur = (currency or "USD").upper()
-    symbol = CURRENCY_SYMBOLS.get(cur, cur)
-    alts = {re.escape(symbol), re.escape(cur)}
-    # Many $-suffix currencies (AUD/CAD/SGD/HKD/NZD/MXN/BRL/NT$) are rendered
-    # by Google as a bare ``$`` once the ``curr`` parameter sets the context.
-    # Accept the bare symbol too, otherwise we'd extract zero prices.
-    if "$" in symbol and symbol != "$":
-        alts.add(re.escape("$"))
-    if len(symbol) == 1:
-        cp = ord(symbol)
-        alts.add(rf"\\x{cp:02x}")
-        alts.add(rf"\\u{cp:04x}")
-    sym = "(?:" + "|".join(sorted(alts, key=len, reverse=True)) + ")"
-    # Number: starts and ends with a digit; may contain digit-grouping
-    # separators ``,`` ``.`` and locale spaces in the middle.
-    num = r"([0-9](?:[0-9.,   ]*[0-9])?)"
-    # Match symbol on EITHER side of the number — Google renders prefix in
-    # most locales (en-US: ``$100``) and postfix in others (de-DE: ``100 €``).
-    return re.compile(rf"(?:{sym}\s?{num})|(?:{num}\s?{sym})")
+    def set(self, key, value):
+        with self._lock:
+            if len(self._data) >= self.max_size:
+                # Evict the oldest expiring entry. Cheap O(n) sweep — fine for
+                # max_size=1024.
+                oldest = min(self._data.items(), key=lambda kv: kv[1][0])[0]
+                self._data.pop(oldest, None)
+            self._data[key] = (time.time() + self.ttl, value)
 
 
-def _extract_price(text: str, currency: str) -> "float | None":
-    """Return the first numeric price for ``currency`` found in ``text``."""
-    m = _currency_price_re(currency).search(text)
-    if not m:
-        return None
-    raw = m.group(1) or m.group(2)
-    return _parse_localized_number(raw) if raw else None
+_search_cache = _TTLCache(SEARCH_CACHE_TTL)
+_provider_cache = _TTLCache(PROVIDER_CACHE_TTL)
+_xotelo_cache = _TTLCache(XOTELO_CACHE_TTL)
 
 
-def _parse_localized_number(raw: str) -> "float | None":
-    """Parse a number that may use either ``1,234.56`` or ``1.234,56`` formats."""
-    s = raw.strip().replace(" ", "").replace(" ", "").replace(" ", "")
-    if not s:
-        return None
-    n_dots = s.count(".")
-    n_commas = s.count(",")
-    if n_dots == 0 and n_commas == 0:
-        try:
-            return float(s)
-        except ValueError:
-            return None
-    if n_dots > 0 and n_commas > 0:
-        # Whichever separator appears LAST is the decimal separator.
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    else:
-        # Only one type of separator. Treat as thousands separator if it
-        # appears multiple times, or if exactly 3 digits follow it (since
-        # currencies almost always use 0-2 fractional digits).
-        sep = "." if n_dots > 0 else ","
-        count = n_dots if n_dots > 0 else n_commas
-        after = s.rsplit(sep, 1)[1]
-        if count > 1 or len(after) == 3:
-            s = s.replace(sep, "")
-        elif sep == ",":
-            s = s.replace(",", ".")
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def brand_star_class(name: str) -> int | None:
-    """Return the star class if the hotel name matches a known luxury brand, else None."""
-    nl = name.lower()
-    # Disqualify non-hotel properties
-    if any(dq in nl for dq in DISQUALIFIERS):
-        return None
-    for star_class in [5, 4]:
-        for brand in LUXURY_BRANDS[star_class]:
-            # Brand must appear at the START of the name, or after a common prefix
-            # like "The ", or be a clean word-boundary match
-            if nl.startswith(brand) or f" {brand}" in f" {nl}":
-                return star_class
-    return None
+# Pure helpers (currency parsing, brand classification) live in parsing.py
+# so they can be unit-tested without Flask/scraping/network deps.
+from parsing import (
+    CURRENCY_SYMBOLS,
+    DEFAULT_MAX_PRICE_USD,
+    LUXURY_BRANDS,
+    DISQUALIFIERS,
+    brand_star_class,
+    currency_price_re as _currency_price_re,
+    default_max_price,
+    extract_price as _extract_price,
+    extract_star_class,
+    parse_localized_number as _parse_localized_number,
+)
 
 
 # ── Destinations ──────────────────────────────────────────────────────────────
@@ -251,7 +170,26 @@ def search_hotels(
     ``language``/``currency``/``region`` are forwarded to Google as ``hl``,
     ``curr`` and ``gl`` so the same backend can serve any market.
     ``max_price`` is in the requested currency; defaults vary by currency.
+
+    Results are cached for SEARCH_CACHE_TTL seconds (default 10 min) keyed on
+    everything that affects what Google returns. ``category_map`` and
+    ``flight_cost`` only affect post-processing of the cached card list, so
+    they're applied after the cache lookup.
     """
+    cur = (currency or "USD").upper()
+    cache_key = (location, checkin, checkout, min_stars, language or "en", cur, region or "")
+    cached = _search_cache.get(cache_key)
+    if cached is not None:
+        # Re-stamp category and flight_cost in case the caller's mapping has
+        # changed since the cache was populated.
+        return [
+            {**h,
+             "category": _category_for(h["location"], category_map),
+             "flight_cost": (flight_cost if flight_cost is not None
+                             else FLIGHT_BUDGET_MAP.get(h["location"], 0))}
+            for h in cached
+        ]
+
     hotel_data = [HotelData(checkin_date=checkin, checkout_date=checkout, location=location)]
     guests = Guests(adults=1)
     ths = THSData.from_interface(hotel_data=hotel_data, guests=guests, room_type="standard")
@@ -271,18 +209,10 @@ def search_hotels(
     if res.status_code != 200:
         return []
 
-    # In USD, prices over 1500 are likely junk; in JPY/IDR/VND that ceiling is
-    # ridiculously low. Caller can override; otherwise pick a sensible default.
+    # In USD, prices over 1500 are likely junk; in JPY/IDR/VND that ceiling
+    # is ridiculously low. Scale automatically for high-denomination currencies.
     if max_price is None:
-        max_price = DEFAULT_MAX_PRICE_USD
-        # Rough multiplier for high-denomination currencies
-        scale = {
-            "JPY": 150, "KRW": 1300, "IDR": 15000, "VND": 25000,
-            "INR": 85, "THB": 35, "PHP": 55, "TWD": 30, "HUF": 350,
-            "RUB": 90,
-        }.get((currency or "USD").upper())
-        if scale:
-            max_price = DEFAULT_MAX_PRICE_USD * scale
+        max_price = default_max_price(currency)
 
     parser = LexborHTMLParser(res.text)
     hotels = []
@@ -299,15 +229,12 @@ def search_hotels(
             if num is not None:
                 review_rating = num
 
-        # Extract star class from Google's HTML tag. The label is localized
-        # ("5-star hotel" / "Hôtel 5 étoiles" / "5성급 호텔" / ...), so we just
-        # grab the first 1–5 digit appearing in the label.
+        # Star class label is localized ("5-star hotel" / "Hôtel 5 étoiles" /
+        # "5성급 호텔" / ...) so extract_star_class just grabs the first digit.
         html_star_class = None
         for span in card.css("span.ne5qie.Ih19Ad"):
-            txt = span.text(strip=True)
-            m = re.search(r"([1-5])", txt)
-            if m:
-                html_star_class = int(m.group(1))
+            html_star_class = extract_star_class(span.text(strip=True))
+            if html_star_class:
                 break
 
         # Also check brand recognition
@@ -357,16 +284,22 @@ def search_hotels(
         })
 
     hotels.sort(key=lambda h: h["price"])
+    _search_cache.set(cache_key, hotels)
     return hotels
 
 
 def fetch_provider_prices(entity_url, language: str = "en", currency: str = "USD"):
     """Fetch a Google Hotels entity page and extract prices from all booking providers."""
+    cur = (currency or "USD").upper()
+    cache_key = (entity_url, language or "en", cur)
+    cached = _provider_cache.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         client = Client(impersonate="chrome_126", verify=False)
         res = client.get(entity_url, params={
             "hl": language or "en",
-            "curr": (currency or "USD").upper(),
+            "curr": cur,
         })
         if res.status_code != 200:
             return {}
@@ -394,6 +327,7 @@ def fetch_provider_prices(entity_url, language: str = "en", currency: str = "USD
                         if key not in providers_found or price < providers_found[key]:
                             providers_found[key] = price
                     break
+        _provider_cache.set(cache_key, providers_found)
         return providers_found
     except Exception:
         return {}
@@ -595,23 +529,36 @@ def api_cheapest_dates():
     date_results = []
 
     def check_date(date_idx, ci, co):
+        # Parallelize destinations within a single date sample. With ~4 workers
+        # and 20+ destinations this is ~4x faster than the prior sequential
+        # loop. Progress reporting is updated as each destination completes.
         all_hotels = []
-        for i, loc in enumerate(dest_names):
-            with progress_lock:
-                sweep_progress["current_date"] = date_idx + 1
-                sweep_progress["current_dest"] = loc
-                sweep_progress["dests_done"] = i
+        completed = 0
+        completed_lock = threading.Lock()
+
+        def search_one(loc):
             try:
-                hotels = search_hotels(
+                return search_hotels(
                     loc, ci, co, min_stars=min_stars,
                     max_price=max_price, category_map=cat_map or None,
                     flight_cost=flight_map.get(loc),
                     **locale,
                 )
-                all_hotels.extend(hotels)
             except Exception:
-                pass
-            time.sleep(0.15)
+                return []
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_loc = {executor.submit(search_one, loc): loc for loc in dest_names}
+            for future in as_completed(future_to_loc):
+                loc = future_to_loc[future]
+                hotels = future.result()
+                all_hotels.extend(hotels)
+                with completed_lock:
+                    completed += 1
+                with progress_lock:
+                    sweep_progress["current_date"] = date_idx + 1
+                    sweep_progress["current_dest"] = loc
+                    sweep_progress["dests_done"] = completed
 
         all_hotels.sort(key=lambda h: h["price"])
         cheapest = all_hotels[0] if all_hotels else None
@@ -731,13 +678,30 @@ def _ota_search_url(provider_code, hotel_name, checkin, checkout,
 def fetch_xotelo_prices(hotel_key, hotel_name, checkin, checkout, currency="USD",
                         language: str = "en", region: "str | None" = None):
     """Fetch per-OTA prices + booking links from the free Xotelo API."""
+    cur = (currency or "USD").upper()
+    # Cache key is hotel-name-agnostic on purpose — Xotelo's response is keyed
+    # off ``hotel_key`` only, so a second call for the same hotel under a
+    # different display name can reuse it. OTA URLs (which DO depend on
+    # hotel_name) are recomputed below from the stored provider code.
+    cache_key = (hotel_key, checkin, checkout, cur, language or "en", region or "")
+    cached = _xotelo_cache.get(cache_key)
+    if cached is not None:
+        return {
+            name: {
+                "rate": info["rate"], "tax": info.get("tax", 0),
+                "url": _ota_search_url(
+                    info.get("_code", ""), hotel_name, checkin, checkout,
+                    language=language, region=region, currency=currency),
+            }
+            for name, info in cached.items()
+        }
     try:
         import requests as req
         res = req.get("https://data.xotelo.com/api/rates", params={
             "hotel_key": hotel_key,
             "chk_in": checkin,
             "chk_out": checkout,
-            "currency": (currency or "USD").upper(),
+            "currency": cur,
         }, timeout=12)
         if res.status_code != 200:
             return {}
@@ -746,12 +710,23 @@ def fetch_xotelo_prices(hotel_key, hotel_name, checkin, checkout, currency="USD"
         result = {}
         for r in rates:
             if r.get("rate"):
+                code = r.get("code", "")
                 url = _ota_search_url(
-                    r.get("code", ""), hotel_name, checkin, checkout,
+                    code, hotel_name, checkin, checkout,
                     language=language, region=region, currency=currency,
                 )
-                result[r["name"]] = {"rate": r["rate"], "tax": r.get("tax", 0), "url": url}
-        return result
+                result[r["name"]] = {
+                    "rate": r["rate"],
+                    "tax": r.get("tax", 0),
+                    "url": url,
+                    "_code": code,  # kept for cache re-stamping
+                }
+        # Cache the result (incl. provider code) so a second call can recompute
+        # hotel-specific URLs without re-hitting Xotelo.
+        _xotelo_cache.set(cache_key, result)
+        # Strip the internal _code field from what we return to callers.
+        return {name: {k: v for k, v in info.items() if k != "_code"}
+                for name, info in result.items()}
     except Exception:
         return {}
 
@@ -766,21 +741,31 @@ def api_compare_prices():
     locale = _locale_params(data)
     enriched = []
 
+    # Map both Xotelo's display names ("Booking.com") and Google's display
+    # names ("booking.com") to the same canonical provider key, so prices
+    # from the two sources merge cleanly.
+    norm_map = {
+        "booking": "booking.com", "agoda": "agoda",
+        "trip": "trip.com", "expedia": "expedia",
+        "hotels": "hotels.com", "traveloka": "traveloka",
+        "vio": "vio.com",
+    }
+
+    def _canonicalize(name: str) -> str:
+        key = name.lower().replace(".com", "").replace(" ", "").strip()
+        for prefix, norm_name in norm_map.items():
+            if prefix in key:
+                return norm_name
+        return name
+
     def enrich(h):
-        providers = {}
-        xotelo = {}
-
-        # Source 1: Google Hotels entity page
-        if h.get("url"):
-            providers = fetch_provider_prices(
-                h["url"],
-                language=locale["language"],
-                currency=locale["currency"],
-            )
-            time.sleep(0.2)
-
-        # Source 2: Xotelo API (needs TripAdvisor key lookup)
+        # Xotelo is the more reliable source (structured per-OTA rates) and
+        # is also faster — try it first. Only fall back to scraping the Google
+        # entity page when Xotelo has no key for this hotel or returned empty.
+        merged: dict[str, dict] = {}
+        source = None
         ta_key = resolve_tripadvisor_key(h.get("name", ""), h.get("location", ""))
+
         if ta_key:
             ci = h.get("checkin", checkin)
             co = h.get("checkout", checkout)
@@ -790,38 +775,34 @@ def api_compare_prices():
                 language=locale["language"],
                 region=locale["region"],
             )
-            time.sleep(0.2)
+            for name, info in xotelo.items():
+                rate = info["rate"] if isinstance(info, dict) else info
+                url = info.get("url", "") if isinstance(info, dict) else ""
+                canon = _canonicalize(name)
+                existing = merged.get(canon)
+                if existing is None or rate < existing["rate"]:
+                    merged[canon] = {"rate": rate, "url": url, "source": "xotelo"}
+                elif not existing.get("url"):
+                    existing["url"] = url
+            if merged:
+                source = "xotelo"
 
-        # Merge: Xotelo returns {name: {rate, tax, url}}, Google returns {name: price}
-        # Normalize everything to {rate, url} dicts
-        merged = {}
-        for name, price in providers.items():
-            merged[name] = {"rate": price, "url": ""}
+        # Fallback: scrape Google's entity page only if Xotelo gave us nothing
+        # useful. The window-regex on Google can mistake a "from $X" banner for
+        # the actual rate, so it's intentionally relegated to a fallback.
+        if not merged and h.get("url"):
+            providers = fetch_provider_prices(
+                h["url"],
+                language=locale["language"],
+                currency=locale["currency"],
+            )
+            for name, price in providers.items():
+                canon = _canonicalize(name)
+                merged[canon] = {"rate": price, "url": "", "source": "google"}
+            if merged:
+                source = "google"
 
-        norm_map = {
-            "booking": "booking.com", "agoda": "agoda",
-            "trip": "trip.com", "expedia": "expedia",
-            "hotels": "hotels.com", "traveloka": "traveloka",
-            "vio": "vio.com",
-        }
-        for name, info in xotelo.items():
-            rate = info["rate"] if isinstance(info, dict) else info
-            url = info.get("url", "") if isinstance(info, dict) else ""
-            key = name.lower().replace(".com", "").replace(" ", "").strip()
-            matched = False
-            for prefix, norm_name in norm_map.items():
-                if prefix in key:
-                    existing = merged.get(norm_name)
-                    if existing is None or rate < existing["rate"]:
-                        merged[norm_name] = {"rate": rate, "url": url}
-                    elif not existing.get("url"):
-                        existing["url"] = url  # keep lower price, add URL
-                    matched = True
-                    break
-            if not matched:
-                merged[name] = {"rate": rate, "url": url}
-
-        return {**h, "providers": merged, "xotelo_key": ta_key}
+        return {**h, "providers": merged, "xotelo_key": ta_key, "providers_source": source}
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(enrich, h) for h in hotels[:15]]

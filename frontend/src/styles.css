@@ -1,0 +1,214 @@
+:root {
+  --bg: #0f1115;
+  --panel: #181c23;
+  --panel-2: #20252e;
+  --border: #2a313d;
+  --text: #e8ecf1;
+  --muted: #8a92a1;
+  --accent: #4d8cf5;
+  --accent-hover: #6aa1ff;
+  --error-bg: #3a1f23;
+  --error-fg: #ff8da0;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+               Roboto, "Helvetica Neue", Arial, "Noto Sans", "Noto Sans CJK JP",
+               sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.app {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.subtitle {
+  margin: 4px 0 16px;
+  color: var(--muted);
+}
+
+.locale-bar {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+.locale-bar label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--muted);
+  gap: 4px;
+}
+
+select, input[type="date"], input[type="text"], input[type="number"] {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  outline: none;
+}
+select:focus, input:focus { border-color: var(--accent); }
+
+.search-form {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: end;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+.search-form label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--muted);
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.search-form label.grow { flex: 1 1 220px; }
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 18px;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms;
+}
+button:hover:not(:disabled) { background: var(--accent-hover); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+  padding: 12px 14px;
+  border-radius: 8px;
+  margin: 16px 0;
+}
+
+.hotel-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.hotel-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hotel-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 8px;
+}
+.hotel-card .name { font-weight: 600; }
+.hotel-card .stars { color: #f5c25b; font-size: 13px; white-space: nowrap; }
+
+.price-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.price { font-size: 20px; font-weight: 600; }
+.per-night { font-size: 13px; color: var(--muted); font-weight: normal; }
+.rating { color: #f5c25b; font-size: 13px; }
+
+.amenities {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.amenities li {
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.actions a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13px;
+}
+.actions a:hover { text-decoration: underline; }
+.actions button {
+  padding: 6px 12px;
+  font-size: 13px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+.actions button:hover { background: rgba(77, 140, 245, 0.12); }
+.muted { color: var(--muted); font-size: 13px; }
+
+.providers {
+  list-style: none;
+  margin: 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.providers li {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+.prov-name { color: var(--muted); }
+.prov-price { font-weight: 500; }
+.prov-link { color: var(--accent); text-decoration: none; padding: 0 4px; }
+
+.empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 32px;
+}
+
+h2 {
+  font-size: 18px;
+  font-weight: 500;
+  margin: 24px 0 0;
+}
