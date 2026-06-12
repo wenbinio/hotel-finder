@@ -125,6 +125,16 @@ for cat in DESTINATIONS.values():
         FLIGHT_BUDGET_MAP[d["name"]] = d["flight_usd"]
 
 
+# Browser fingerprint for primp. Must be a profile the installed primp build
+# actually supports — unknown names silently fall back to "random", which
+# Google blocks (this is what broke all searches when chrome_126 was retired).
+IMPERSONATE_PROFILE = "chrome_146"
+
+
+def make_client() -> Client:
+    return Client(impersonate=IMPERSONATE_PROFILE, verify=False)
+
+
 # ── Hotel search ──────────────────────────────────────────────────────────────
 def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5) -> list[dict]:
     """Search Google Hotels for hotels at or above the given star class."""
@@ -138,7 +148,7 @@ def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5
         "curr": "USD",
         "q": f"{min_stars} star hotels {location}",
     }
-    client = Client(impersonate="chrome_126", verify=False)
+    client = make_client()
     city = location.strip().replace(" ", "+").lower()
     url = f"https://www.google.com/travel/hotels/{city}"
     res = client.get(url, params=params)
@@ -230,7 +240,7 @@ def search_hotels(location: str, checkin: str, checkout: str, min_stars: int = 5
 def fetch_provider_prices(entity_url):
     """Fetch a Google Hotels entity page and extract prices from all booking providers."""
     try:
-        client = Client(impersonate="chrome_126", verify=False)
+        client = make_client()
         res = client.get(entity_url, params={"hl": "en", "curr": "USD"})
         if res.status_code != 200:
             return {}
@@ -552,7 +562,7 @@ def api_compare_prices():
         if ta_key:
             ci = h.get("checkin", checkin)
             co = h.get("checkout", checkout)
-            xotelo = fetch_xotelo_prices(ta_key, ci, co)
+            xotelo = fetch_xotelo_prices(ta_key, h.get("name", ""), ci, co)
             time.sleep(0.2)
 
         # Merge: Xotelo returns {name: {rate, tax, url}}, Google returns {name: price}
@@ -587,9 +597,13 @@ def api_compare_prices():
         return {**h, "providers": merged, "xotelo_key": ta_key}
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(enrich, h) for h in hotels[:15]]
+        futures = {executor.submit(enrich, h): h for h in hotels[:15]}
         for f in as_completed(futures):
-            enriched.append(f.result())
+            try:
+                enriched.append(f.result())
+            except Exception:
+                h = futures[f]
+                enriched.append({**h, "providers": {}, "xotelo_key": None})
 
     enriched.sort(key=lambda h: h.get("price", 9999))
     return jsonify({"hotels": enriched})
