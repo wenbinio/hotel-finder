@@ -1,0 +1,29 @@
+.git/
+.gitignore
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.local
+
+# Frontend artifacts — Dockerfile rebuilds the SPA from source
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+static/
+.vite/
+
+# Not needed inside the Cloud Run container
+supabase/
+scripts/
+tests/
+README.md
+*.md
+vercel.json
+render.yaml
