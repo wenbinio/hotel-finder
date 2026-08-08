@@ -476,9 +476,16 @@ def _canonical_google_search_redirect(
         )
     except ValueError as error:
         raise ValueError("unsafe Google search redirect") from error
+    query_values = [value for key, value in query if key == "q"]
+    ths_values = [value for key, value in query if key == "ths"]
+    currency_values = [value for key, value in query if key == "curr"]
+    language_values = [value for key, value in query if key == "hl"]
     if (
-        [value for key, value in query if key == "q"] != [expected_query]
-        or len([value for key, value in query if key == "ths" and value]) != 1
+        query_values != [expected_query]
+        or len(ths_values) != 1
+        or not ths_values[0]
+        or currency_values != ["USD"]
+        or language_values != ["en"]
     ):
         raise ValueError("unsafe Google search redirect")
     return urlunsplit(("https", _GOOGLE_SEARCH_HOST, _GOOGLE_SEARCH_PATH, parsed.query, ""))
