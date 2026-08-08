@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from datetime import date
 from threading import Event
 
@@ -22,6 +24,66 @@ VALID_HOTEL = {
     "category": "non_beachfront",
     "flight_cost": 126.0,
 }
+
+DEFAULT_UPSTREAM_HTML = r"""
+<html><body><div class="uaTTDe">
+  <h2 class="BgYkof">Default Boundary Hotel</h2>
+  <span class="KFi5wf lA0BZ">4.7</span>
+  <span class="ne5qie Ih19Ad">5-star hotel</span>
+  <span class="LtjZ2d">Pool</span><span>$220</span>
+  <a href="/travel/hotels/entity/default-boundary">open</a>
+</div>Agoda \u0024180</body></html>
+"""
+
+
+class StaticHTMLResponse:
+    status_code = 200
+    text = DEFAULT_UPSTREAM_HTML
+    headers = {"content-type": "text/html; charset=utf-8"}
+
+
+class StaticLowLevelClient:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return StaticHTMLResponse()
+
+
+class StaticJSONResponse:
+    status_code = 200
+    headers = {"content-type": "application/json"}
+
+    def __init__(self):
+        self.payload = {
+            "result": {
+                "rates": [
+                    {"name": "Agoda", "code": "Agoda", "rate": 88.0, "tax": 0}
+                ]
+            }
+        }
+        self.body = json.dumps(self.payload).encode("utf-8")
+
+    def json(self):
+        return self.payload
+
+    def iter_content(self, chunk_size=1):
+        size = (len(self.body) or 1) if chunk_size is None else chunk_size
+        for offset in range(0, len(self.body), size):
+            yield self.body[offset : offset + size]
+
+    def close(self):
+        return None
+
+
+class StaticXoteloClient:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return StaticJSONResponse()
 
 
 @pytest.fixture
@@ -143,6 +205,69 @@ def test_search_all_returns_partial_results_and_warning(app_factory, monkeypatch
     assert response.json["warnings"] == [
         {"code": "timeout", "location": "Phuket", "source": "google"}
     ]
+
+
+def test_search_all_default_boundary_works_in_executor_without_flask_context(
+    app_factory,
+):
+    upstream = StaticLowLevelClient()
+    application = app_factory(CLIENT_FACTORY=lambda: upstream)
+
+    response = application.test_client().post(
+        "/api/search-all",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-11",
+            "destinations": ["Bangkok"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json["totalNonBeachfront"] == 1
+    assert response.json["results"]["non_beachfront"][0]["name"] == (
+        "Default Boundary Hotel"
+    )
+    assert response.json["warnings"] == []
+
+
+def test_compare_default_boundary_works_in_executor_without_flask_context(
+    app_factory,
+):
+    upstream = StaticLowLevelClient()
+    xotelo = StaticXoteloClient()
+    application = app_factory(
+        CLIENT_FACTORY=lambda: upstream,
+        XOTELO_CLIENT=xotelo,
+    )
+    hotel = {
+        **VALID_HOTEL,
+        "name": "Pullman Bangkok Hotel G",
+        "url": "https://www.google.com/travel/hotels/entity/default-boundary",
+    }
+
+    response = application.test_client().post(
+        "/api/compare-prices",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-14",
+            "hotels": [hotel],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json["hotels"][0]["providers"] == {
+        "agoda": {
+            "rate": 88.0,
+            "url": (
+                "https://www.agoda.com/search?q=Pullman+Bangkok+Hotel+G"
+                "&checkIn=2026-08-10&los=1"
+            ),
+        }
+    }
+    assert response.json["failedHotels"] == []
+    assert response.json["warnings"] == []
+    assert len(upstream.calls) == 1
+    assert len(xotelo.calls) == 1
 
 
 def test_search_all_filters_requested_destinations_by_flight_budget(app_factory):
@@ -486,6 +611,36 @@ def test_request_id_is_bounded_validated_and_returned_on_errors(app_factory):
     assert 1 <= len(generated) <= 64
 
 
+def test_application_logger_emits_structured_info_records_by_default(app_factory):
+    application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
+    records = []
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    capture = CaptureHandler(level=logging.INFO)
+    application.logger.addHandler(capture)
+    try:
+        application.test_client().get(
+            "/api/destinations",
+            headers={"X-Request-ID": "local-info-42"},
+        )
+    finally:
+        application.logger.removeHandler(capture)
+
+    assert application.logger.getEffectiveLevel() == logging.INFO
+    request_record = next(
+        record for record in records if record.getMessage() == "request_complete"
+    )
+    formatter = application.logger.handlers[0].formatter
+    assert formatter is not None
+    rendered = json.loads(formatter.format(request_record))
+    assert rendered["event"] == "request_complete"
+    assert rendered["request_id"] == "local-info-42"
+    assert rendered["response_status"] == 200
+
+
 def test_health_uses_cache_and_job_public_snapshots(app_factory):
     application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
     response = application.test_client().get("/api/health")
@@ -563,6 +718,21 @@ def test_spa_and_unknown_api_routes_are_not_shadowed_by_flask_static(app_factory
 
     assert spa.status_code == 200
     assert b'<div id="root"></div>' in spa.data
+    assert missing.status_code == 404
+    assert missing.is_json
+    assert missing.json["error"]["code"] == "not_found"
+    assert wrong_method.status_code == 405
+    assert wrong_method.is_json
+    assert wrong_method.json["error"]["code"] == "method_not_allowed"
+
+
+def test_exact_api_root_never_falls_through_to_spa(app_factory):
+    application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
+    client = application.test_client()
+
+    missing = client.get("/api")
+    wrong_method = client.post("/api")
+
     assert missing.status_code == 404
     assert missing.is_json
     assert missing.json["error"]["code"] == "not_found"

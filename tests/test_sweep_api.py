@@ -9,6 +9,30 @@ import pytest
 
 from app import UpstreamError, create_app
 
+DEFAULT_UPSTREAM_HTML = """
+<html><body><div class="uaTTDe">
+  <h2 class="BgYkof">Sweep Boundary Hotel</h2>
+  <span class="KFi5wf lA0BZ">4.7</span>
+  <span class="ne5qie Ih19Ad">5-star hotel</span>
+  <span>$220</span>
+</div></body></html>
+"""
+
+
+class StaticHTMLResponse:
+    status_code = 200
+    text = DEFAULT_UPSTREAM_HTML
+    headers = {"content-type": "text/html; charset=utf-8"}
+
+
+class StaticLowLevelClient:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return StaticHTMLResponse()
+
 
 def hotel(location, checkin, checkout, price=100.0):
     return {
@@ -155,6 +179,25 @@ def test_completed_sweep_snapshot_has_json_safe_progress_partials_and_legacy_res
     }
     assert result["totalBeachfront"] == 1
     assert result["totalNonBeachfront"] == 1
+
+
+def test_sweep_default_boundary_works_in_executor_without_flask_context(
+    app_factory,
+):
+    upstream = StaticLowLevelClient()
+    application = app_factory(CLIENT_FACTORY=lambda: upstream)
+    created = start_sweep(
+        application.test_client(), sampleCount=1, locations=["Bangkok"]
+    )
+    manager = application.extensions["hotel_finder"]["job_manager"]
+
+    snapshot = manager.wait(created.json["jobId"], timeout=2)
+
+    assert snapshot.status == "completed"
+    assert snapshot.result["dates"][0]["hotel_count"] == 1
+    assert snapshot.result["bestDateResults"]["non_beachfront"][0]["name"] == (
+        "Sweep Boundary Hotel"
+    )
 
 
 def test_sweep_parallelizes_at_most_four_destinations_per_date(app_factory):

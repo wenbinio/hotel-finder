@@ -14,6 +14,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager, suppress
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,10 @@ SEARCH_CACHE_SECONDS = 600
 EMPTY_SEARCH_CACHE_SECONDS = 60
 PROVIDER_CACHE_SECONDS = 900
 XOTELO_CACHE_SECONDS = 900
+XOTELO_READ_TIMEOUT_SECONDS = 1
+XOTELO_STREAM_CHUNK_BYTES = 16 * 1024
+XOTELO_MAX_RESPONSE_BYTES = 1_000_000
+UPSTREAM_SEMAPHORE_POLL_SECONDS = 0.05
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
@@ -218,6 +223,88 @@ def _services() -> dict[str, Any]:
     return current_app.extensions["hotel_finder"]
 
 
+def _runtime_services(runtime: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    return _services() if runtime is None else runtime
+
+
+def _raise_if_upstream_aborted(
+    services: Mapping[str, Any],
+    *,
+    source: str,
+    cancelled: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+) -> None:
+    if cancelled is not None and cancelled():
+        raise UpstreamError(
+            "upstream_failure",
+            "The upstream operation was cancelled.",
+            source=source,
+            retryable=False,
+        )
+    if deadline is not None and services["clock"]() >= deadline:
+        raise UpstreamError("timeout", source=source, retryable=True)
+
+
+@contextmanager
+def _upstream_slot(
+    services: Mapping[str, Any],
+    *,
+    source: str,
+    cancelled: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+):
+    semaphore = _acquire_upstream_slot(
+        services,
+        source=source,
+        cancelled=cancelled,
+        deadline=deadline,
+    )
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+def _acquire_upstream_slot(
+    services: Mapping[str, Any],
+    *,
+    source: str,
+    cancelled: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+):
+    semaphore = services["upstream_semaphore"]
+    acquired = False
+    try:
+        if cancelled is None and deadline is None:
+            acquired = semaphore.acquire()
+        else:
+            while not acquired:
+                _raise_if_upstream_aborted(
+                    services,
+                    source=source,
+                    cancelled=cancelled,
+                    deadline=deadline,
+                )
+                wait_seconds = UPSTREAM_SEMAPHORE_POLL_SECONDS
+                if deadline is not None:
+                    wait_seconds = min(
+                        wait_seconds,
+                        max(0.001, deadline - services["clock"]()),
+                    )
+                acquired = semaphore.acquire(timeout=wait_seconds)
+        _raise_if_upstream_aborted(
+            services,
+            source=source,
+            cancelled=cancelled,
+            deadline=deadline,
+        )
+        return semaphore
+    except BaseException:
+        if acquired:
+            semaphore.release()
+        raise
+
+
 def _bounded_upstream_limit(value: object) -> int:
     try:
         configured = int(value)
@@ -295,6 +382,14 @@ def _response_header(response: object, name: str) -> str | None:
     return None
 
 
+def _is_timeout_error(error: BaseException) -> bool:
+    return (
+        isinstance(error, (requests.Timeout, TimeoutError))
+        or "timeout" in type(error).__name__.casefold()
+        or "timed out" in str(error).casefold()
+    )
+
+
 def _response_html(response: object, source: str) -> str:
     text = getattr(response, "text", None)
     content_type = _response_header(response, "content-type")
@@ -324,12 +419,9 @@ def _recognized_search_page(html: str, hotels: Sequence[object]) -> bool:
     if hotels:
         return True
     normalized = html.casefold()
-    if re.search(r'''class\s*=\s*["'][^"']*\buattde\b[^"']*["']''', normalized):
-        return True
     return any(
         marker in normalized
         for marker in (
-            "data-google-hotels-search",
             "no available properties",
             "no properties found",
             "no hotels found",
@@ -347,8 +439,6 @@ def _recognized_provider_page(
     return any(
         marker in normalized
         for marker in (
-            "data-google-hotel-entity",
-            "/travel/hotels/entity/",
             "no prices available",
             "no booking options",
         )
@@ -356,10 +446,13 @@ def _recognized_provider_page(
 
 
 def call_with_retry[T](
-    operation: Callable[[], T], *, cancelled: Callable[[], bool] | None = None
+    operation: Callable[[], T],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    runtime: Mapping[str, Any] | None = None,
 ) -> T:
     """Run an upstream operation with no more than one transient retry."""
-    services = _services()
+    services = _runtime_services(runtime)
     is_cancelled = cancelled or (lambda: False)
     for attempt in range(2):
         if is_cancelled():
@@ -390,17 +483,24 @@ def _request_upstream(
     source: str,
     return_redirect: bool = False,
     cancelled: Callable[[], bool] | None = None,
+    runtime: Mapping[str, Any] | None = None,
 ) -> object:
-    services = _services()
+    services = _runtime_services(runtime)
 
     def operation() -> object:
         try:
-            with services["upstream_semaphore"]:
+            with _upstream_slot(
+                services, source=source, cancelled=cancelled
+            ):
+                _raise_if_upstream_aborted(
+                    services, source=source, cancelled=cancelled
+                )
                 response = services["client_factory"]().get(url, params=dict(params))
+        except UpstreamError:
+            raise
         except Exception as error:
-            is_timeout = isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
             raise UpstreamError(
-                "timeout" if is_timeout else "transport",
+                "timeout" if _is_timeout_error(error) else "transport",
                 source=source,
                 retryable=True,
             ) from error
@@ -426,7 +526,9 @@ def _request_upstream(
             )
         return response
 
-    return call_with_retry(operation, cancelled=cancelled)
+    return call_with_retry(
+        operation, cancelled=cancelled, runtime=services
+    )
 
 
 def _safe_parsed_hotels(
@@ -460,11 +562,13 @@ def search_hotels(
     min_stars: int = 5,
     *,
     cancelled: Callable[[], bool] | None = None,
+    runtime: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Search Google Hotels through the per-app cache and upstream gate."""
     normalized_location = location.strip()
     key = (normalized_location, checkin, checkout, int(min_stars))
-    cache = _services()["search_cache"]
+    services = _runtime_services(runtime)
+    cache = services["search_cache"]
 
     cached = cache.get(key)
     if cached is not None:
@@ -495,6 +599,7 @@ def search_hotels(
             params=params,
             source="google",
             cancelled=cancelled,
+            runtime=services,
         )
         html = _response_html(response, "google")
         hotels = _safe_parsed_hotels(
@@ -533,12 +638,14 @@ def fetch_provider_prices(
     *,
     checkin: str | None = None,
     checkout: str | None = None,
+    runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
     """Fetch a validated Google entity page and parse provider prices."""
     canonical_url = _authoritative_google_url(
         validate_google_hotel_url(entity_url), checkin, checkout
     )
-    cache = _services()["provider_cache"]
+    services = _runtime_services(runtime)
+    cache = services["provider_cache"]
     cache_key = (canonical_url, checkin or "", checkout or "", "USD")
     cached = cache.get(cache_key)
     if cached is not None:
@@ -556,6 +663,7 @@ def fetch_provider_prices(
             params=request_params,
             source="google_provider",
             return_redirect=True,
+            runtime=services,
         )
         status_code = getattr(response, "status_code", None)
         if status_code in _REDIRECT_STATUSES:
@@ -578,6 +686,7 @@ def fetch_provider_prices(
                 params=request_params,
                 source="google_provider",
                 return_redirect=True,
+                runtime=services,
             )
             if getattr(response, "status_code", None) in _REDIRECT_STATUSES:
                 raise UpstreamError(
@@ -696,66 +805,240 @@ def _ota_search_url(
     return urls.get(provider_code, "")
 
 
+def _read_xotelo_rates(
+    response: object,
+    services: Mapping[str, Any],
+    deadline: float,
+) -> list[object]:
+    content_type = _response_header(response, "content-type")
+    if content_type and "json" not in content_type.casefold():
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    raw = getattr(response, "raw", None)
+    read_once = getattr(raw, "read1", None)
+    iter_content = getattr(response, "iter_content", None)
+    if not callable(read_once) and not callable(iter_content):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+
+    def chunks():
+        if callable(read_once):
+            while True:
+                chunk = read_once(
+                    XOTELO_STREAM_CHUNK_BYTES, decode_content=True
+                )
+                if not chunk:
+                    return
+                yield chunk
+        else:
+            # A one-byte fallback keeps deadline checks meaningful for response
+            # doubles and non-urllib3 clients whose iterator may fill each chunk.
+            yield from iter_content(chunk_size=1)
+
+    body = bytearray()
+    stream = iter(chunks())
+    try:
+        while True:
+            _raise_if_upstream_aborted(
+                services, source="xotelo", deadline=deadline
+            )
+            try:
+                chunk = next(stream)
+            except StopIteration:
+                _raise_if_upstream_aborted(
+                    services, source="xotelo", deadline=deadline
+                )
+                break
+            _raise_if_upstream_aborted(
+                services, source="xotelo", deadline=deadline
+            )
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise UpstreamError(
+                    "unexpected_content", source="xotelo", retryable=False
+                )
+            if chunk:
+                if len(body) + len(chunk) > XOTELO_MAX_RESPONSE_BYTES:
+                    raise UpstreamError(
+                        "unexpected_content", source="xotelo", retryable=False
+                    )
+                body.extend(chunk)
+    except UpstreamError:
+        raise
+    except (requests.Timeout, TimeoutError) as error:
+        raise UpstreamError(
+            "timeout", source="xotelo", retryable=True
+        ) from error
+    except requests.RequestException as error:
+        raise UpstreamError(
+            "timeout" if _is_timeout_error(error) else "transport",
+            source="xotelo",
+            retryable=True,
+        ) from error
+    except Exception as error:
+        raise UpstreamError(
+            "timeout" if _is_timeout_error(error) else "transport",
+            source="xotelo",
+            retryable=True,
+        ) from error
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        ) from error
+    if not isinstance(payload, Mapping):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    if payload.get("error") not in (None, False, ""):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    rates = result.get("rates")
+    if not isinstance(rates, list):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    return rates
+
+
+def _request_xotelo_rates(
+    services: Mapping[str, Any],
+    *,
+    hotel_key: object,
+    checkin: str,
+    checkout: str,
+    currency: str,
+    deadline: float,
+) -> list[object]:
+    response = None
+    try:
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=deadline
+        )
+        remaining = max(0.001, deadline - services["clock"]())
+        response = services["xotelo_client"].get(
+            "https://data.xotelo.com/api/rates",
+            params={
+                "hotel_key": hotel_key,
+                "chk_in": checkin,
+                "chk_out": checkout,
+                "currency": currency,
+            },
+            timeout=TimeoutSauce(
+                connect=min(CONNECT_TIMEOUT_SECONDS, remaining),
+                read=min(XOTELO_READ_TIMEOUT_SECONDS, remaining),
+                total=remaining,
+            ),
+            allow_redirects=False,
+            stream=True,
+        )
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=deadline
+        )
+        status_code = getattr(response, "status_code", None)
+        if status_code == 429:
+            raise UpstreamError(
+                "rate_limited", source="xotelo", retryable=True
+            )
+        if isinstance(status_code, int) and 500 <= status_code <= 599:
+            raise UpstreamError(
+                "upstream_unavailable", source="xotelo", retryable=True
+            )
+        if status_code in _REDIRECT_STATUSES:
+            raise UpstreamError(
+                "redirect", source="xotelo", retryable=False
+            )
+        if status_code != 200:
+            raise UpstreamError(
+                "upstream_response", source="xotelo", retryable=False
+            )
+        return _read_xotelo_rates(response, services, deadline)
+    except UpstreamError:
+        raise
+    except Exception as error:
+        raise UpstreamError(
+            "timeout" if _is_timeout_error(error) else "transport",
+            source="xotelo",
+            retryable=True,
+        ) from error
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
+
+
 def fetch_xotelo_prices(
     hotel_key: object,
     hotel_name: str,
     checkin: str,
     checkout: str,
     currency: str = "USD",
+    *,
+    runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Fetch cached legacy Xotelo rates with one total-deadline-bounded attempt."""
-    services = _services()
+    services = _runtime_services(runtime)
     cache = services["xotelo_cache"]
     key = (hotel_key, checkin, checkout, currency, "xotelo")
 
     def load() -> tuple[tuple[str, str, float, float], ...]:
-        try:
-            with services["upstream_semaphore"]:
-                response = services["xotelo_client"].get(
-                    "https://data.xotelo.com/api/rates",
-                    params={
-                        "hotel_key": hotel_key,
-                        "chk_in": checkin,
-                        "chk_out": checkout,
-                        "currency": currency,
-                    },
-                    timeout=TimeoutSauce(
-                        connect=CONNECT_TIMEOUT_SECONDS,
-                        read=READ_TIMEOUT_SECONDS,
-                        total=TOTAL_TIMEOUT_SECONDS,
-                    ),
-                    allow_redirects=False,
+        deadline = services["clock"]() + TOTAL_TIMEOUT_SECONDS
+        semaphore = _acquire_upstream_slot(
+            services, source="xotelo", deadline=deadline
+        )
+        outcome: dict[str, object] = {}
+        finished = threading.Event()
+
+        def request_in_background() -> None:
+            try:
+                outcome["rates"] = _request_xotelo_rates(
+                    services,
+                    hotel_key=hotel_key,
+                    checkin=checkin,
+                    checkout=checkout,
+                    currency=currency,
+                    deadline=deadline,
                 )
-        except Exception as error:
-            is_timeout = (
-                isinstance(error, (requests.Timeout, TimeoutError))
-                or "timeout" in type(error).__name__.casefold()
-            )
-            raise UpstreamError(
-                "timeout" if is_timeout else "transport",
-                source="xotelo",
-                retryable=True,
-            ) from error
-        status_code = getattr(response, "status_code", None)
-        if status_code == 429:
-            raise UpstreamError("rate_limited", source="xotelo", retryable=True)
-        if isinstance(status_code, int) and 500 <= status_code <= 599:
-            raise UpstreamError(
-                "upstream_unavailable", source="xotelo", retryable=True
-            )
-        if status_code in _REDIRECT_STATUSES:
-            raise UpstreamError("redirect", source="xotelo", retryable=False)
-        if status_code != 200:
-            raise UpstreamError(
-                "upstream_response", source="xotelo", retryable=False
-            )
+            except BaseException as error:
+                outcome["error"] = error
+            finally:
+                semaphore.release()
+                finished.set()
+
+        worker = threading.Thread(
+            target=request_in_background,
+            name="xotelo-upstream",
+            daemon=True,
+        )
         try:
-            payload = response.json()
-            rates = payload.get("result", {}).get("rates", [])
-        except (AttributeError, TypeError, ValueError) as error:
-            raise UpstreamError(
-                "unexpected_content", source="xotelo", retryable=False
-            ) from error
+            worker.start()
+        except BaseException:
+            semaphore.release()
+            raise
+
+        while not finished.is_set():
+            remaining = deadline - services["clock"]()
+            if remaining <= 0:
+                raise UpstreamError(
+                    "timeout", source="xotelo", retryable=True
+                )
+            finished.wait(
+                min(UPSTREAM_SEMAPHORE_POLL_SECONDS, remaining)
+            )
+
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        rates = outcome.get("rates")
         if not isinstance(rates, list):
             raise UpstreamError(
                 "unexpected_content", source="xotelo", retryable=False
@@ -1168,7 +1451,10 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
     application = _HotelFinderFlask(__name__, static_folder=None)
     if test_config:
         application.config.update(test_config)
+    application.logger.setLevel(logging.INFO)
     formatter = _StructuredFormatter()
+    if not application.logger.handlers:
+        application.logger.addHandler(logging.StreamHandler())
     for handler in application.logger.handlers:
         handler.setFormatter(formatter)
 
@@ -1202,7 +1488,7 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
     job_manager = application.config.get("JOB_MANAGER")
     if job_manager is None:
         job_manager = SweepJobManager(clock=clock)
-    application.extensions["hotel_finder"] = {
+    services: dict[str, Any] = {
         "search_cache": search_cache,
         "provider_cache": provider_cache,
         "xotelo_cache": xotelo_cache,
@@ -1217,22 +1503,29 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         ),
         "xotelo_client": configured("XOTELO_CLIENT", requests),
         "today": configured("TODAY_PROVIDER", date.today),
-        "search_hotels": configured(
-            "SEARCH_HOTELS",
-            lambda *args, **kwargs: search_hotels(*args, **kwargs),
-        ),
-        "provider_prices": configured(
-            "PROVIDER_PRICES",
-            lambda *args, **kwargs: fetch_provider_prices(*args, **kwargs),
-        ),
-        "xotelo_prices": configured(
-            "XOTELO_PRICES",
-            lambda *args, **kwargs: fetch_xotelo_prices(*args, **kwargs),
-        ),
         "resolve_tripadvisor": configured(
             "RESOLVE_TRIPADVISOR", resolve_tripadvisor_key
         ),
     }
+    services["search_hotels"] = configured(
+        "SEARCH_HOTELS",
+        lambda *args, **kwargs: search_hotels(
+            *args, runtime=services, **kwargs
+        ),
+    )
+    services["provider_prices"] = configured(
+        "PROVIDER_PRICES",
+        lambda *args, **kwargs: fetch_provider_prices(
+            *args, runtime=services, **kwargs
+        ),
+    )
+    services["xotelo_prices"] = configured(
+        "XOTELO_PRICES",
+        lambda *args, **kwargs: fetch_xotelo_prices(
+            *args, runtime=services, **kwargs
+        ),
+    )
+    application.extensions["hotel_finder"] = services
 
     allowed_origins = application.config.get("ALLOWED_ORIGINS")
     if allowed_origins is None:
@@ -1314,7 +1607,7 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
 
     @application.errorhandler(NotFound)
     def handle_not_found(_error: NotFound):
-        if request.path.startswith("/api/"):
+        if request.path == "/api" or request.path.startswith("/api/"):
             return _error_response(
                 "not_found",
                 "API route was not found.",
@@ -1325,7 +1618,7 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
 
     @application.errorhandler(MethodNotAllowed)
     def handle_method_not_allowed(_error: MethodNotAllowed):
-        if request.path.startswith("/api/"):
+        if request.path == "/api" or request.path.startswith("/api/"):
             return _error_response(
                 "method_not_allowed",
                 "HTTP method is not allowed for this API route.",
@@ -1726,7 +2019,7 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
 
     @application.get("/<path:path>")
     def serve_static(path: str):
-        if path.startswith("api/"):
+        if path == "api" or path.startswith("api/"):
             return _error_response(
                 "not_found", "API route was not found.", {"path": f"/{path}"}, 404
             )

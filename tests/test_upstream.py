@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 import pytest
+import requests
 
 import app as app_module
 from app import (
@@ -34,14 +37,80 @@ class FakeResponse:
         self.headers = headers or {"content-type": "text/html; charset=utf-8"}
 
 
+class RawBytesReader:
+    def __init__(self, response):
+        self.response = response
+        self.offset = 0
+        self.calls = []
+
+    def read1(self, size, decode_content=True):
+        self.calls.append((size, decode_content))
+        body = self.response.body
+        if self.offset >= len(body):
+            return b""
+        chunk = body[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
 class JsonResponse:
     def __init__(self, payload, status_code=200, headers=None):
         self.payload = payload
         self.status_code = status_code
         self.headers = headers or {"content-type": "application/json"}
+        self.body = json.dumps(payload).encode("utf-8")
+        self.closed = False
+        self.raw = RawBytesReader(self)
 
     def json(self):
         return self.payload
+
+    def iter_content(self, chunk_size=1):
+        size = (len(self.body) or 1) if chunk_size is None else chunk_size
+        for offset in range(0, len(self.body), size):
+            yield self.body[offset : offset + size]
+
+    def close(self):
+        self.closed = True
+
+
+class SlowStreamingJsonResponse(JsonResponse):
+    def __init__(self, payload, clock, seconds_per_chunk=8):
+        super().__init__(payload)
+        self.clock = clock
+        self.seconds_per_chunk = seconds_per_chunk
+        self.raw = RawBytesReader(self)
+
+        original_read = self.raw.read1
+        max_read = max(1, len(self.body) // 2)
+
+        def slow_read(size, decode_content=True):
+            self.clock.advance(self.seconds_per_chunk)
+            return original_read(
+                min(size, max_read), decode_content=decode_content
+            )
+
+        self.raw.read1 = slow_read
+
+    def iter_content(self, chunk_size=1):
+        raise AssertionError("bounded raw reads must be used when available")
+        yield b""  # pragma: no cover
+
+
+class FailingStreamingJsonResponse(JsonResponse):
+    def __init__(self, payload):
+        super().__init__(payload)
+
+        def failing_read(_size, decode_content=True):
+            del decode_content
+            raise requests.ConnectionError("Read timed out while streaming")
+
+        self.raw.read1 = failing_read
+
+    def iter_content(self, chunk_size=1):
+        del chunk_size
+        raise requests.ConnectionError("Read timed out while streaming")
+        yield b""  # pragma: no cover
 
 
 class SequenceClient:
@@ -55,6 +124,20 @@ class SequenceClient:
         if isinstance(next_value, BaseException):
             raise next_value
         return next_value
+
+
+class BlockingHeaderClient:
+    def __init__(self, response, hold_seconds=0.25):
+        self.response = response
+        self.hold_seconds = hold_seconds
+        self.started = threading.Event()
+        self.finished = threading.Event()
+
+    def get(self, _url, **_kwargs):
+        self.started.set()
+        self.finished.wait(self.hold_seconds)
+        self.finished.set()
+        return self.response
 
 
 class FakeClock:
@@ -76,6 +159,33 @@ class DeterministicRng:
     def uniform(self, minimum, maximum):
         self.calls.append((minimum, maximum))
         return self.value
+
+
+class HeldTrackingSemaphore:
+    def __init__(self):
+        self._semaphore = threading.BoundedSemaphore(1)
+        assert self._semaphore.acquire()
+        self.waiting = threading.Event()
+
+    def acquire(self, blocking=True, timeout=None):
+        self.waiting.set()
+        return self._semaphore.acquire(blocking=blocking, timeout=timeout)
+
+    def release(self):
+        self._semaphore.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.release()
+
+    def try_acquire(self):
+        return self._semaphore.acquire(blocking=False)
+
+    def release_held_slot(self):
+        self._semaphore.release()
 
 
 @pytest.fixture
@@ -266,7 +376,7 @@ def test_genuine_empty_search_is_cached_for_only_sixty_seconds(app_factory):
     assert len(client.calls) == 2
 
 
-def test_structurally_recognized_search_with_only_filtered_cards_is_empty(
+def test_filtered_search_card_without_no_results_marker_is_not_cached_as_empty(
     app_factory,
 ):
     html = """
@@ -275,13 +385,32 @@ def test_structurally_recognized_search_with_only_filtered_cards_is_empty(
       <span class="ne5qie Ih19Ad">3-star hotel</span><span>$120</span>
     </div></body></html>
     """
-    client = SequenceClient([FakeResponse(text=html)])
+    client = SequenceClient([FakeResponse(text=html), FakeResponse()])
     application = app_factory(CLIENT_FACTORY=lambda: client)
 
     with application.app_context():
-        assert search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5) == []
+        with pytest.raises(UpstreamError) as caught:
+            search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        recovered = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
 
-    assert len(client.calls) == 1
+    assert caught.value.code == "unexpected_content"
+    assert recovered[0]["name"] == "Test Grand Hotel"
+    assert len(client.calls) == 2
+
+
+def test_lone_google_result_wrapper_is_not_proof_of_genuine_empty(app_factory):
+    maintenance = '<html><div class="uaTTDe">Scheduled maintenance</div></html>'
+    client = SequenceClient([FakeResponse(text=maintenance), FakeResponse()])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        recovered = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+
+    assert caught.value.code == "unexpected_content"
+    assert recovered[0]["name"] == "Test Grand Hotel"
+    assert len(client.calls) == 2
 
 
 def test_provider_rejects_bad_url_before_constructing_request(app_factory):
@@ -359,7 +488,32 @@ def test_provider_rejects_generic_maintenance_html_without_caching_it(app_factor
     assert len(client.calls) == 2
 
 
-def test_provider_caches_structurally_recognized_genuine_empty(app_factory):
+def test_unrelated_google_entity_link_is_not_proof_of_genuine_empty(app_factory):
+    maintenance = (
+        '<html><a href="/travel/hotels/entity/unrelated">'
+        "Scheduled maintenance</a></html>"
+    )
+    provider_html = r"<html>Agoda \u0024180</html>"
+    client = SequenceClient(
+        [FakeResponse(text=maintenance), FakeResponse(text=provider_html)]
+    )
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_provider_prices(
+                "https://www.google.com/travel/hotels/entity/maintenance-link"
+            )
+        recovered = fetch_provider_prices(
+            "https://www.google.com/travel/hotels/entity/maintenance-link"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert recovered == {"agoda": 180.0}
+    assert len(client.calls) == 2
+
+
+def test_provider_caches_explicit_no_prices_marker(app_factory):
     html = "<html><main data-google-hotel-entity>No prices available</main></html>"
     client = SequenceClient([FakeResponse(text=html)])
     application = app_factory(CLIENT_FACTORY=lambda: client)
@@ -466,6 +620,44 @@ def test_call_with_retry_stops_before_jitter_and_retry_when_cancelled(app_factor
     assert rng.calls == []
 
 
+def test_google_semaphore_wait_is_cancellable_without_releasing_unowned_slot(
+    app_factory,
+):
+    gate = HeldTrackingSemaphore()
+    client = SequenceClient([FakeResponse()])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+    application.extensions["hotel_finder"]["upstream_semaphore"] = gate
+    cancelled = threading.Event()
+
+    def request_google():
+        with application.app_context():
+            return app_module._request_upstream(
+                "https://www.google.com/travel/hotels/bangkok",
+                params={"hl": "en"},
+                source="google",
+                cancelled=cancelled.is_set,
+            )
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(request_google)
+    acquired_during_cancel = False
+    try:
+        assert gate.waiting.wait(1)
+        cancelled.set()
+        with pytest.raises(UpstreamError) as caught:
+            future.result(timeout=1)
+        assert caught.value.code == "upstream_failure"
+        acquired_during_cancel = gate.try_acquire()
+        assert acquired_during_cancel is False
+        assert client.calls == []
+    finally:
+        if acquired_during_cancel:
+            gate.release()
+        else:
+            gate.release_held_slot()
+        pool.shutdown(wait=True)
+
+
 def test_xotelo_cache_is_full_key_ttl_bounded_and_returns_detached_copies(app_factory):
     clock = FakeClock()
     payload = {
@@ -502,6 +694,102 @@ def test_xotelo_cache_is_full_key_ttl_bounded_and_returns_detached_copies(app_fa
     timeout = client.calls[0][1]["timeout"]
     assert timeout.total == 15
     assert timeout.connect_timeout == 5
+    assert timeout.read_timeout == 1
+    assert client.calls[0][1]["stream"] is True
+
+
+def test_xotelo_slow_stream_fails_at_elapsed_deadline_and_is_not_cached(
+    app_factory,
+):
+    clock = FakeClock()
+    slow = SlowStreamingJsonResponse({"result": {"rates": []}}, clock)
+    valid_payload = {
+        "result": {
+            "rates": [{"name": "Agoda", "code": "Agoda", "rate": 88.0}]
+        }
+    }
+    client = SequenceClient([slow, JsonResponse(valid_payload)])
+    application = app_factory(CLOCK=clock, XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "timeout"
+    assert slow.closed is True
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
+def test_xotelo_header_wait_obeys_hard_deadline_without_releasing_live_slot(
+    app_factory, monkeypatch
+):
+    monkeypatch.setattr(app_module, "TOTAL_TIMEOUT_SECONDS", 0.05)
+    response = JsonResponse({"result": {"rates": []}})
+    client = BlockingHeaderClient(response)
+    application = app_factory(XOTELO_CLIENT=client, UPSTREAM_CONCURRENCY=1)
+    gate = application.extensions["hotel_finder"]["upstream_semaphore"]
+
+    started_at = time.monotonic()
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert caught.value.code == "timeout"
+    assert elapsed < 0.15
+    assert client.started.is_set()
+    assert gate.acquire(blocking=False) is False
+    assert client.finished.wait(1)
+    assert gate.acquire(timeout=1)
+    gate.release()
+    assert response.closed is True
+
+
+def test_xotelo_oversized_stream_is_rejected_without_caching(app_factory):
+    oversized = JsonResponse({"result": {"rates": []}})
+    oversized.body = b"x" * 1_100_000
+    valid_payload = {
+        "result": {
+            "rates": [{"name": "Agoda", "code": "Agoda", "rate": 88.0}]
+        }
+    }
+    client = SequenceClient([oversized, JsonResponse(valid_payload)])
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert oversized.closed is True
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
+def test_xotelo_stream_read_timeout_is_reported_as_timeout(app_factory):
+    client = SequenceClient(
+        [FailingStreamingJsonResponse({"result": {"rates": []}})]
+    )
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "timeout"
 
 
 def test_xotelo_uses_one_attempt_and_does_not_cache_failure(app_factory):
@@ -531,6 +819,45 @@ def test_xotelo_uses_one_attempt_and_does_not_cache_failure(app_factory):
     assert result["Agoda"]["rate"] == 88.0
     assert len(client.calls) == 2
     assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "malformed_payload",
+    [
+        {},
+        {"error": "upstream API error"},
+        {"result": []},
+        {"result": {}},
+        {"result": {"rates": {}}},
+    ],
+)
+def test_xotelo_rejects_malformed_shape_without_caching_it(
+    app_factory, malformed_payload
+):
+    valid_payload = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0, "tax": 0}
+            ]
+        }
+    }
+    client = SequenceClient(
+        [JsonResponse(malformed_payload), JsonResponse(valid_payload)]
+    )
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
 
 
 def test_xotelo_cache_key_preserves_tripadvisor_key_identity(app_factory):
