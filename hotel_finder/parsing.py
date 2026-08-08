@@ -111,6 +111,9 @@ PROVIDER_NAMES = (
     ("Traveloka", "traveloka"),
     ("Official Site", "official"),
 )
+GOOGLE_LODGING_CLICK_PATH = "/travel/lodging/clk"
+SIMPLE_PROVIDER_MARKUP_MAX_CHARS = 4_096
+INERT_PROVIDER_TEXT_TAGS = frozenset({"script", "style", "template", "noscript"})
 PRICE_PATTERN = re.compile(
     r"\$((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+))(?![0-9,])"
 )
@@ -240,19 +243,108 @@ def parse_hotel_cards(html: str, context: ParseContext) -> list[dict[str, Any]]:
     return sorted(hotels, key=lambda hotel: float(hotel["price"]))
 
 
-def parse_provider_prices(html: str) -> dict[str, float]:
-    """Extract valid provider prices from a Google Hotels entity page without fetching it."""
+def _visible_text_fragments(row: Any) -> list[str]:
+    fragments: list[str] = []
+    for node in row.traverse(include_text=True, skip_empty=True):
+        if not node.is_text_node:
+            continue
+        ancestor = node.parent
+        inert = False
+        while ancestor is not None:
+            attributes = ancestor.attributes
+            normalized_style = re.sub(
+                r"\s+", "", attributes.get("style", "").casefold()
+            )
+            if (
+                ancestor.tag in INERT_PROVIDER_TEXT_TAGS
+                or "hidden" in attributes
+                or attributes.get("aria-hidden", "").casefold() == "true"
+                or "display:none" in normalized_style
+                or "visibility:hidden" in normalized_style
+            ):
+                inert = True
+                break
+            ancestor = ancestor.parent
+        if inert:
+            continue
+        text = " ".join(node.text().split())
+        if text:
+            fragments.append(text)
+    return fragments
+
+
+def _provider_key_in_offer(fragments: list[str]) -> str | None:
+    labels: set[str] = set()
+    for text in fragments:
+        for display_name, provider_key in PROVIDER_NAMES:
+            if re.search(
+                rf"(?<![\w.]){re.escape(display_name)}(?![\w.])",
+                text,
+                re.IGNORECASE,
+            ):
+                labels.add(provider_key)
+    return next(iter(labels)) if len(labels) == 1 else None
+
+
+def _valid_prices(text: str) -> list[float]:
+    prices: list[float] = []
+    for value in PRICE_PATTERN.findall(text):
+        try:
+            price = float(value.replace(",", ""))
+        except ValueError:
+            continue
+        if 10 < price < 2000:
+            prices.append(price)
+    return prices
+
+
+def _is_google_lodging_offer(row: Any) -> bool:
+    href = row.attributes.get("href", "")
+    return href == GOOGLE_LODGING_CLICK_PATH or href.startswith(
+        f"{GOOGLE_LODGING_CLICK_PATH}?"
+    )
+
+
+def _parse_structured_provider_prices(rows: list[Any]) -> dict[str, float]:
+    providers: dict[str, float] = {}
+    for row in rows:
+        fragments = _visible_text_fragments(row)
+        provider_key = _provider_key_in_offer(fragments)
+        if provider_key is None:
+            continue
+        prices = _valid_prices(" ".join(fragments))
+        if prices:
+            price = min(prices)
+            providers[provider_key] = min(price, providers.get(provider_key, price))
+    return providers
+
+
+def _parse_simple_provider_markup(text: str) -> dict[str, float]:
     providers: dict[str, float] = {}
     labels: list[tuple[int, int, str]] = []
     for display_name, provider_key in PROVIDER_NAMES:
-        for match in re.finditer(re.escape(display_name), html, re.IGNORECASE):
+        for match in re.finditer(re.escape(display_name), text, re.IGNORECASE):
             labels.append((match.start(), match.end(), provider_key))
     labels.sort()
     for index, (_, label_end, provider_key) in enumerate(labels):
-        next_label_start = labels[index + 1][0] if index + 1 < len(labels) else len(html)
-        chunk = html[label_end : min(label_end + 300, next_label_start)]
+        next_label_start = labels[index + 1][0] if index + 1 < len(labels) else len(text)
+        chunk = text[label_end : min(label_end + 300, next_label_start)]
         for value in re.findall(r"(?:\\x24|\\u0024|\$)(\d+)", chunk):
             price = float(value)
             if 10 < price < 2000:
                 providers[provider_key] = min(price, providers.get(provider_key, price))
     return providers
+
+
+def parse_provider_prices(html: str) -> dict[str, float]:
+    """Extract row-associated provider prices from Google Hotels entity markup."""
+    parser = LexborHTMLParser(html)
+    offer_rows = [row for row in parser.css("a[href]") if _is_google_lodging_offer(row)]
+    if offer_rows:
+        return _parse_structured_provider_prices(offer_rows)
+    if (
+        len(html) > SIMPLE_PROVIDER_MARKUP_MAX_CHARS
+        or parser.css_first("script, style, template, noscript") is not None
+    ):
+        return {}
+    return _parse_simple_provider_markup(" ".join(_visible_text_fragments(parser.root)))

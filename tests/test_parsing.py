@@ -105,6 +105,74 @@ def test_provider_parser_does_not_claim_price_after_next_provider_label():
     assert parse_provider_prices(html) == {"booking.com": 230.0}
 
 
+def test_provider_parser_binds_visible_offer_price_over_later_script_decoy():
+    html = r"""
+    <html><body>
+      <a href="/travel/lodging/clk?pc=real-offer">
+        <div><span><span>Agoda</span></span></div>
+        <div><span>$185</span><span>Visit site</span></div>
+      </a>
+      <script>window.bootstrap = {"provider":"Agoda","price":"\u002417"};</script>
+    </body></html>
+    """
+
+    assert parse_provider_prices(html) == {"agoda": 185.0}
+
+
+def test_provider_parser_never_borrows_price_from_another_offer_row():
+    html = """
+    <a href="/travel/lodging/clk?pc=unavailable"><span>Agoda</span></a>
+    <a href="/travel/lodging/clk?pc=unlabelled"><span>$90</span></a>
+    """
+
+    assert parse_provider_prices(html) == {}
+
+
+def test_provider_parser_fails_closed_on_script_only_provider_data():
+    html = r"""
+    <html><body><main>Hotel details</main>
+    <script>window.bootstrap = {"provider":"Agoda","price":"\x2417"};</script>
+    </body></html>
+    """
+
+    assert parse_provider_prices(html) == {}
+
+
+def test_provider_parser_ignores_inert_text_inside_offer_row():
+    html = r"""
+    <a href="/travel/lodging/clk?pc=scripted-offer">
+      <script>Agoda</script><span>$17</span>
+    </a>
+    """
+
+    assert parse_provider_prices(html) == {}
+
+
+def test_provider_parser_reads_direct_visible_text_in_offer_row():
+    html = '<a href="/travel/lodging/clk?pc=direct-offer">Agoda $185</a>'
+
+    assert parse_provider_prices(html) == {"agoda": 185.0}
+
+
+def test_provider_parser_ignores_comments_and_attributes_in_simple_markup():
+    html = '<html><!-- Agoda $17 --><body data-offer="Agoda $18">Hotel</body></html>'
+
+    assert parse_provider_prices(html) == {}
+
+
+def test_provider_parser_ignores_hidden_labels_and_prices_in_offer_rows():
+    html = """
+    <a href="/travel/lodging/clk?pc=hidden-label">
+      <span hidden>Agoda</span><span>$17</span>
+    </a>
+    <a href="/travel/lodging/clk?pc=visible-offer">
+      <span>Agoda</span><span aria-hidden="true">$18</span><span>$185</span>
+    </a>
+    """
+
+    assert parse_provider_prices(html) == {"agoda": 185.0}
+
+
 def test_hotel_parser_skips_malformed_price_without_aborting_later_cards():
     html = """
     <div class="uaTTDe"><h2 class="BgYkof">Broken Price Hotel</h2>
