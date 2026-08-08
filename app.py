@@ -19,7 +19,7 @@ from contextlib import contextmanager, suppress
 from datetime import date
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote_plus, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from fast_hotels.hotels_impl import Guests, HotelData, THSData
@@ -82,6 +82,11 @@ XOTELO_MAX_RATE_VALUE = 1_000_000.0
 UPSTREAM_SEMAPHORE_POLL_SECONDS = 0.05
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_GOOGLE_SEARCH_HOST = "www.google.com"
+_GOOGLE_SEARCH_PATH = "/travel/search"
+_MAX_GOOGLE_SEARCH_REDIRECT_URL_LENGTH = 2_048
+_MAX_GOOGLE_SEARCH_REDIRECT_QUERY_LENGTH = 1_024
+_MAX_GOOGLE_SEARCH_REDIRECT_QUERY_FIELDS = 32
 
 DESTINATIONS = {
     "beachfront": [
@@ -425,6 +430,60 @@ def _response_header(response: object, name: str) -> str | None:
     return None
 
 
+def _canonical_google_search_redirect(
+    source_url: str, location: str | None, expected_query: str
+) -> str:
+    """Resolve one Google Hotels search redirect into a bounded canonical URL."""
+    if (
+        not isinstance(location, str)
+        or not location
+        or len(location) > _MAX_GOOGLE_SEARCH_REDIRECT_URL_LENGTH
+        or any(
+            character.isspace()
+            or unicodedata.category(character).startswith("C")
+            for character in location
+        )
+    ):
+        raise ValueError("unsafe Google search redirect")
+    target = urljoin(source_url, location)
+    if len(target) > _MAX_GOOGLE_SEARCH_REDIRECT_URL_LENGTH:
+        raise ValueError("unsafe Google search redirect")
+    try:
+        parsed = urlsplit(target)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("unsafe Google search redirect") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != _GOOGLE_SEARCH_HOST
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != _GOOGLE_SEARCH_PATH
+        or len(parsed.query) > _MAX_GOOGLE_SEARCH_REDIRECT_QUERY_LENGTH
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in unquote(parsed.path) + unquote(parsed.query)
+        )
+    ):
+        raise ValueError("unsafe Google search redirect")
+    try:
+        query = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=_MAX_GOOGLE_SEARCH_REDIRECT_QUERY_FIELDS,
+        )
+    except ValueError as error:
+        raise ValueError("unsafe Google search redirect") from error
+    if (
+        [value for key, value in query if key == "q"] != [expected_query]
+        or len([value for key, value in query if key == "ths" and value]) != 1
+    ):
+        raise ValueError("unsafe Google search redirect")
+    return urlunsplit(("https", _GOOGLE_SEARCH_HOST, _GOOGLE_SEARCH_PATH, parsed.query, ""))
+
+
 def _is_timeout_error(error: BaseException) -> bool:
     return (
         isinstance(error, (requests.Timeout, TimeoutError))
@@ -661,13 +720,36 @@ def search_hotels(
             "q": f"{min_stars} star hotels {normalized_location}",
         }
         city = normalized_location.replace(" ", "+").lower()
+        source_url = f"https://www.google.com/travel/hotels/{city}"
         response = _request_upstream(
-            f"https://www.google.com/travel/hotels/{city}",
+            source_url,
             params=params,
             source="google",
+            return_redirect=True,
             cancelled=cancelled,
             runtime=services,
         )
+        if getattr(response, "status_code", None) in _REDIRECT_STATUSES:
+            try:
+                target = _canonical_google_search_redirect(
+                    source_url,
+                    _response_header(response, "location"),
+                    str(params["q"]),
+                )
+            except ValueError as error:
+                raise UpstreamError(
+                    "unsafe_redirect", source="google", retryable=False
+                ) from error
+            response = _request_upstream(
+                target,
+                params={},
+                source="google",
+                return_redirect=True,
+                cancelled=cancelled,
+                runtime=services,
+            )
+            if getattr(response, "status_code", None) in _REDIRECT_STATUSES:
+                raise UpstreamError("redirect", source="google", retryable=False)
         html = _response_html(response, "google")
         hotels = _safe_parsed_hotels(
             html, normalized_location, checkin, checkout, int(min_stars)

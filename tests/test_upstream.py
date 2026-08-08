@@ -368,6 +368,75 @@ def test_search_parses_cards_and_nulls_non_entity_links(app_factory):
     assert len(client.calls) == 1
 
 
+def test_search_manually_follows_one_revalidated_google_search_redirect(
+    app_factory,
+):
+    target = (
+        "/travel/search?q=5+star+hotels+Bangkok&qs=OAA"
+        "&ths=redirected-ths&hl=en&curr=USD"
+    )
+    client = SequenceClient(
+        [
+            FakeResponse(status_code=302, headers={"location": target}),
+            FakeResponse(),
+        ]
+    )
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        hotels = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+
+    assert hotels[0]["name"] == "Test Grand Hotel"
+    assert [call[0] for call in client.calls] == [
+        "https://www.google.com/travel/hotels/bangkok",
+        "https://www.google.com" + target,
+    ]
+    assert client.calls[1][1]["params"] == {}
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://evil.example/travel/search?ths=redirected-ths&q=5+star+hotels+Bangkok",
+        "http://www.google.com/travel/search?ths=redirected-ths&q=5+star+hotels+Bangkok",
+        "https://trusted@www.google.com/travel/search?ths=redirected-ths&q=5+star+hotels+Bangkok",
+        "https://www.google.com:443/travel/search?ths=redirected-ths&q=5+star+hotels+Bangkok",
+        "https://www.google.com:444/travel/search?ths=redirected-ths&q=5+star+hotels+Bangkok",
+        "/travel/hotels/bangkok?ths=redirected-ths&q=5+star+hotels+Bangkok",
+        "/travel/search?ths=redirected-ths&q=other+hotels",
+        "/travel/search?q=5+star+hotels+Bangkok",
+        "/travel/search?ths=redirected-ths&q=5+star+hotels+Bangkok\r\nX-Test:%20injected",
+        "/travel/search?ths=" + ("x" * 2_100) + "&q=5+star+hotels+Bangkok",
+    ],
+)
+def test_search_rejects_unsafe_google_search_redirect_targets(app_factory, location):
+    client = SequenceClient([FakeResponse(status_code=302, headers={"location": location})])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+
+    assert caught.value.code == "unsafe_redirect"
+    assert len(client.calls) == 1
+
+
+def test_search_rejects_a_second_google_search_redirect(app_factory):
+    target = "/travel/search?q=5+star+hotels+Bangkok&ths=redirected-ths"
+    client = SequenceClient(
+        [
+            FakeResponse(status_code=302, headers={"location": target}),
+            FakeResponse(status_code=302, headers={"location": target}),
+        ]
+    )
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+
+    assert caught.value.code == "redirect"
+    assert len(client.calls) == 2
+
+
 @pytest.mark.parametrize(
     ("status_code", "expected_code", "expected_calls"),
     [(404, "upstream_response", 1), (429, "rate_limited", 2), (503, "upstream_unavailable", 2)],
