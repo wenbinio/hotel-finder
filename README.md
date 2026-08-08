@@ -4,6 +4,8 @@ Hotel Finder is a single-instance, private tool for comparing future hotel stays
 
 This application is deliberately not a public, multi-user service. It keeps jobs and caches in one process's memory so it must run as one Gunicorn worker with eight request threads.
 
+An ordinary Render web service URL is publicly reachable. The included deployment configuration does not add authentication, and CORS is not authentication. Before any remote exposure, this private edition requires an authentication-capable reverse proxy or access gateway whose protection cannot be bypassed through the origin, or a service reachable only on a private network. Otherwise, keep it local or VPN-only.
+
 ## Windows setup
 
 Install Python 3.13 and Node.js 22.12 or newer, then run these commands from the repository root in PowerShell:
@@ -79,24 +81,26 @@ Only these environment variables are used for normal deployment:
 | `HOTEL_FINDER_UPSTREAM_CONCURRENCY` | `4` | Upstream destination concurrency; supported range is 1–6. |
 | `HOTEL_FINDER_ALLOWED_ORIGINS` | unset | Comma-separated, exact private origins allowed to call `/api/*`. |
 
-Leave `HOTEL_FINDER_ALLOWED_ORIGINS` unset for the safe same-origin default. If a private frontend has a different origin, set only its exact HTTPS origin, for example `https://hotel.example.internal`; do not use `*` or expose the service directly to the public internet.
+Leave `HOTEL_FINDER_ALLOWED_ORIGINS` unset for the same-origin browser default. If a private frontend has a different origin, set only its exact HTTPS origin, for example `https://hotel.example.internal`, and do not use `*`. CORS controls which browser origins may read API responses; it is not access control and does not stop direct requests to the service.
 
-## Deploy
+## Protected remote deployment prerequisites
 
-The included `render.yaml` starts exactly one threaded Gunicorn worker. In a Render-connected repository, commit the generated `static/` bundle and push the branch selected for deployment:
+The included `render.yaml` describes the required single threaded Gunicorn worker, but it does not make Render private. Do not create or update a remote deployment until an authentication-capable reverse proxy or access gateway protects the origin, or the service is restricted to a private network. Verify that the ordinary service URL cannot bypass that protection. If those controls are unavailable, use the local instructions above and connect only through your VPN.
+
+After those prerequisites are in place, commit the generated `static/` bundle and push the protected deployment branch:
 
 ```powershell
 git status
 git push origin main
 ```
 
-Create the Render web service from the repository blueprint, confirm that it uses `render.yaml`, and set only the private environment variables above when needed. Render's health check is `/api/health`. After deployment, open `https://<your-service>/api/health`; it must return successfully before a browser smoke test.
+Create the service from the repository blueprint, confirm that it uses `render.yaml`, and set only the environment variables above when needed. Render's health check is `/api/health`. Test that endpoint through the protected URL, then prove an unauthenticated request cannot reach the application directly before running a browser smoke test.
 
 To test the same runtime shape with Docker:
 
 ```powershell
 docker build --tag hotel-finder:local .
-docker run --rm --publish 5001:5001 hotel-finder:local
+docker run --rm --publish 127.0.0.1:5001:5001 hotel-finder:local
 ```
 
 Then request <http://127.0.0.1:5001/api/health>. The container health check uses that endpoint as well. Docker and Render deployment validate only service health; still perform a future-date search and confirm a displayed provider price before relying on it.
