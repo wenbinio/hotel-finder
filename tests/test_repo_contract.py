@@ -180,7 +180,12 @@ def test_static_verifier_rejects_asset_path_escapes():
         verify_static.referenced_assets('<script src="/../outside.js"></script>')
 
 
-def _write_static_tree(tmp_path: Path, index: str, files: tuple[str, ...]) -> Path:
+def _write_static_tree(
+    tmp_path: Path,
+    index: str,
+    files: tuple[str, ...],
+    manifest: dict[str, object] | None = None,
+) -> Path:
     static = tmp_path / "static"
     static.mkdir()
     (static / "index.html").write_text(index, encoding="utf-8")
@@ -188,35 +193,128 @@ def _write_static_tree(tmp_path: Path, index: str, files: tuple[str, ...]) -> Pa
         target = static / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(name, encoding="utf-8")
+    if manifest is not None:
+        manifest_path = static / ".vite" / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return static
 
 
-def test_static_verifier_reports_dangling_references(tmp_path: Path):
+GRAPH_MANIFEST = {
+    "src/main.jsx": {
+        "file": "assets/entry.js",
+        "isEntry": True,
+        "imports": ["_vendor.js"],
+        "dynamicImports": ["src/lazy.jsx"],
+        "css": ["assets/entry.css"],
+        "assets": ["assets/logo.svg"],
+    },
+    "_vendor.js": {
+        "file": "assets/vendor.js",
+        "css": ["assets/vendor.css"],
+        "assets": ["assets/font.woff2"],
+    },
+    "src/lazy.jsx": {
+        "file": "assets/lazy.js",
+        "isDynamicEntry": True,
+        "css": ["assets/lazy.css"],
+        "assets": ["assets/lazy.png"],
+    },
+}
+GRAPH_FILES = (
+    "favicon.svg",
+    "icons.svg",
+    "assets/entry.js",
+    "assets/entry.css",
+    "assets/logo.svg",
+    "assets/vendor.js",
+    "assets/vendor.css",
+    "assets/font.woff2",
+    "assets/lazy.js",
+    "assets/lazy.css",
+    "assets/lazy.png",
+)
+GRAPH_INDEX = (
+    '<link rel="icon" href="/favicon.svg">'
+    '<script src="/assets/entry.js"></script>'
+    '<link rel="stylesheet" href="/assets/entry.css">'
+)
+PUBLIC_FILES = {"favicon.svg", "icons.svg"}
+
+
+def _graph_fixture(
+    tmp_path: Path,
+    *,
+    missing: str | None = None,
+    extra: tuple[str, ...] = (),
+    manifest: dict[str, object] | None = None,
+) -> tuple[Path, set[str]]:
+    files = tuple(name for name in GRAPH_FILES if name != missing) + extra
     static = _write_static_tree(
         tmp_path,
-        '<script src="/assets/missing.js"></script>',
-        (),
+        GRAPH_INDEX,
+        files,
+        GRAPH_MANIFEST if manifest is None else manifest,
     )
-    result = verify_static.verify_static_tree(static, {"index.html"})
-    assert result.missing == ("assets/missing.js",)
+    tracked = {"index.html", ".vite/manifest.json", *files}
+    return static, tracked
+
+
+def test_static_verifier_accepts_complete_split_manifest_graph(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path)
+    result = verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+    assert result == verify_static.StaticVerification((), (), ())
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ("assets/vendor.js", "assets/font.woff2", "assets/lazy.png"),
+)
+def test_static_verifier_reports_missing_transitive_outputs(tmp_path: Path, missing: str):
+    static, tracked = _graph_fixture(tmp_path, missing=missing)
+    result = verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+    assert result.missing == (missing,)
+
+
+def test_static_verifier_rejects_unknown_imported_manifest_entry(tmp_path: Path):
+    manifest = json.loads(json.dumps(GRAPH_MANIFEST))
+    manifest["src/main.jsx"]["imports"] = ["_missing.js"]
+    static, tracked = _graph_fixture(tmp_path, manifest=manifest)
+    with pytest.raises(ValueError, match="unknown manifest entry"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
+def test_static_verifier_rejects_manifest_path_traversal(tmp_path: Path):
+    manifest = json.loads(json.dumps(GRAPH_MANIFEST))
+    manifest["_vendor.js"]["assets"] = [r"..\outside.woff2"]
+    static, tracked = _graph_fixture(tmp_path, manifest=manifest)
+    with pytest.raises(ValueError, match="must not escape"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
+def test_static_verifier_requires_vite_manifest(tmp_path: Path):
+    static = _write_static_tree(tmp_path, GRAPH_INDEX, GRAPH_FILES)
+    tracked = {"index.html", *GRAPH_FILES}
+    with pytest.raises(FileNotFoundError, match="manifest"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
+def test_static_verifier_reports_dangling_root_html_reference(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path)
+    index = static / "index.html"
+    index.write_text(GRAPH_INDEX + '<img src="/missing-root.svg">', encoding="utf-8")
+    result = verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+    assert result.missing == ("missing-root.svg",)
 
 
 def test_static_verifier_reports_orphan_generated_assets_but_not_root_files(tmp_path: Path):
-    static = _write_static_tree(
-        tmp_path,
-        '<link rel="icon" href="/favicon.svg"><script src="/assets/app.js"></script>',
-        ("favicon.svg", "icons.svg", "assets/app.js", "assets/old.js"),
-    )
-    tracked = {"index.html", "favicon.svg", "icons.svg", "assets/app.js", "assets/old.js"}
-    result = verify_static.verify_static_tree(static, tracked)
+    static, tracked = _graph_fixture(tmp_path, extra=("assets/old.js",))
+    result = verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
     assert result.orphaned == ("assets/old.js",)
 
 
 def test_static_verifier_reports_untracked_assets(tmp_path: Path):
-    static = _write_static_tree(
-        tmp_path,
-        '<script src="/assets/app.js"></script>',
-        ("assets/app.js",),
-    )
-    result = verify_static.verify_static_tree(static, {"index.html"})
-    assert result.untracked == ("assets/app.js",)
+    static, tracked = _graph_fixture(tmp_path)
+    tracked.remove("assets/lazy.js")
+    result = verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+    assert result.untracked == ("assets/lazy.js",)
