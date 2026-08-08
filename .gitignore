@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 .env
 venv/
+.worktrees/
+.venv/
+frontend/node_modules/
+frontend/dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
