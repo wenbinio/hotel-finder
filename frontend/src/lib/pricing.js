@@ -7,10 +7,32 @@ function compareText(left, right) {
   return String(left || '').localeCompare(String(right || ''), undefined, { sensitivity: 'base' })
 }
 
+function normalizedGoogleEntityUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const url = new URL(value)
+    if (
+      url.protocol !== 'https:'
+      || url.hostname !== 'www.google.com'
+      || url.port
+      || url.username
+      || url.password
+      || !url.pathname.startsWith('/travel/hotels/entity/')
+    ) return null
+    url.search = ''
+    url.hash = ''
+    return url.href
+  } catch {
+    return null
+  }
+}
+
 export function stableHotelKey(hotel) {
+  const entityUrl = normalizedGoogleEntityUrl(hotel.url)
+  if (entityUrl) return JSON.stringify(['url', entityUrl])
   const location = String(hotel.location || '').trim().toLowerCase()
   const name = String(hotel.name || '').trim().toLowerCase()
-  return JSON.stringify([location, name])
+  return JSON.stringify(['hotel', location, name])
 }
 
 export function bestNightlyRate(hotel) {

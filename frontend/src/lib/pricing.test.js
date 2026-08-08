@@ -7,6 +7,18 @@ describe('hotel pricing', () => {
       .not.toBe(stableHotelKey({ name: 'Grand Hotel', location: 'Phuket' }))
   })
 
+  it('does not merge same-named colocated hotels with different Google entities', () => {
+    const common = { name: 'Grand Hotel', location: 'Bangkok' }
+
+    expect(stableHotelKey({
+      ...common,
+      url: 'https://www.google.com/travel/hotels/entity/first?checkin=2026-08-09',
+    })).not.toBe(stableHotelKey({
+      ...common,
+      url: 'https://www.google.com/travel/hotels/entity/second?checkin=2026-08-09',
+    }))
+  })
+
   it('uses the lowest provider rate when available', () => {
     expect(bestNightlyRate({ price: 100, providers: { x: { rate: 80 }, y: 85 } })).toBe(80)
   })

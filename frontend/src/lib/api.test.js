@@ -6,6 +6,27 @@ afterEach(() => {
 })
 
 describe('fetchJson', () => {
+  it('keeps a caller content type as the single case-insensitive header', async () => {
+    let sentHeaders
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((_path, options) => {
+      sentHeaders = options.headers
+      return Promise.resolve(new Response('{}', {
+        headers: { 'content-type': 'application/json' },
+      }))
+    }))
+
+    await fetchJson('/api/search', {
+      method: 'POST',
+      body: {},
+      headers: { 'Content-Type': 'application/merge-patch+json' },
+    })
+
+    expect(sentHeaders).toBeInstanceOf(Headers)
+    expect([...sentHeaders.entries()]).toEqual([
+      ['content-type', 'application/merge-patch+json'],
+    ])
+  })
+
   it('turns an HTML 500 into a friendly ApiError', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<h1>error</h1>', {
       status: 500,
@@ -35,6 +56,26 @@ describe('fetchJson', () => {
     await expect(fetchJson('/api/search')).rejects.toMatchObject({
       code: 'invalid_dates', details: { checkin: 'past' },
     })
+  })
+
+  it('recognizes JSON content types without case sensitivity', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{"ok":true}', {
+      headers: { 'content-type': 'Application/JSON; Charset=UTF-8' },
+    })))
+
+    await expect(fetchJson('/api/search')).resolves.toEqual({ ok: true })
+  })
+
+  it('rethrows an AbortError raised while parsing the response body', async () => {
+    const abort = new DOMException('The operation was aborted', 'AbortError')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: vi.fn().mockRejectedValue(abort),
+    }))
+
+    await expect(fetchJson('/api/search')).rejects.toBe(abort)
   })
 })
 
