@@ -49,21 +49,15 @@ class TTLCache[K: Hashable, V]:
     def set(self, key: K, value: V, ttl_seconds: float | None = None) -> None:
         ttl = self._validated_ttl(ttl_seconds)
         with self._lock:
-            now = self._clock()
-            self._evict_expired_locked(now)
-            if key not in self._entries and len(self._entries) >= self._max_entries:
-                earliest_key = min(
-                    self._entries,
-                    key=lambda candidate: self._entries[candidate].expires_at,
-                )
-                del self._entries[earliest_key]
-            self._entries[key] = _Entry(value=value, expires_at=now + ttl)
+            self._set_locked(key, value, ttl, self._clock())
 
     def get_or_load(
         self,
         key: K,
         loader: Callable[[], V],
         ttl_seconds: float | None = None,
+        *,
+        before_store: Callable[[], None] | None = None,
     ) -> CacheResult[V]:
         ttl = self._validated_ttl(ttl_seconds)
 
@@ -88,7 +82,10 @@ class TTLCache[K: Hashable, V]:
 
             try:
                 value = loader()
-                self.set(key, value, ttl_seconds=ttl)
+                with self._lock:
+                    if before_store is not None:
+                        before_store()
+                    self._set_locked(key, value, ttl, self._clock())
             except BaseException as exc:
                 with self._lock:
                     if self._inflight.get(key) is flight:
@@ -125,6 +122,16 @@ class TTLCache[K: Hashable, V]:
         expired = [key for key, entry in self._entries.items() if entry.expires_at <= now]
         for key in expired:
             del self._entries[key]
+
+    def _set_locked(self, key: K, value: V, ttl: float, now: float) -> None:
+        self._evict_expired_locked(now)
+        if key not in self._entries and len(self._entries) >= self._max_entries:
+            earliest_key = min(
+                self._entries,
+                key=lambda candidate: self._entries[candidate].expires_at,
+            )
+            del self._entries[earliest_key]
+        self._entries[key] = _Entry(value=value, expires_at=now + ttl)
 
     def _validated_ttl(self, ttl_seconds: float | None) -> float:
         ttl = self._ttl_seconds if ttl_seconds is None else ttl_seconds

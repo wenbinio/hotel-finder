@@ -11,6 +11,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -37,7 +38,12 @@ from werkzeug.exceptions import (
 from hotel_finder import __version__
 from hotel_finder.cache import TTLCache
 from hotel_finder.jobs import JobConflict, JobNotFound, SweepJob, SweepJobManager
-from hotel_finder.parsing import ParseContext, parse_hotel_cards, parse_provider_prices
+from hotel_finder.parsing import (
+    ParseContext,
+    has_structural_hotel_card,
+    parse_hotel_cards,
+    parse_provider_prices,
+)
 from hotel_finder.validation import (
     CompareRequest,
     HotelInput,
@@ -59,6 +65,8 @@ READ_TIMEOUT_SECONDS = 12
 TOTAL_TIMEOUT_SECONDS = 15
 DEFAULT_UPSTREAM_CONCURRENCY = 4
 MAX_UPSTREAM_CONCURRENCY = 6
+DEFAULT_UPSTREAM_QUEUE_TIMEOUT_SECONDS = 2.0
+MIN_UPSTREAM_QUEUE_TIMEOUT_SECONDS = 0.01
 SEARCH_CACHE_SECONDS = 600
 EMPTY_SEARCH_CACHE_SECONDS = 60
 PROVIDER_CACHE_SECONDS = 900
@@ -66,6 +74,11 @@ XOTELO_CACHE_SECONDS = 900
 XOTELO_READ_TIMEOUT_SECONDS = 1
 XOTELO_STREAM_CHUNK_BYTES = 16 * 1024
 XOTELO_MAX_RESPONSE_BYTES = 1_000_000
+XOTELO_MAX_RAW_RATES = 2_048
+XOTELO_MAX_STORED_RATES = 128
+XOTELO_MAX_PROVIDER_NAME_LENGTH = 128
+XOTELO_MAX_PROVIDER_CODE_LENGTH = 64
+XOTELO_MAX_RATE_VALUE = 1_000_000.0
 UPSTREAM_SEMAPHORE_POLL_SECONDS = 0.05
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -178,6 +191,7 @@ class UpstreamError(RuntimeError):
             "rate_limited": f"The {source} service rate-limited the request.",
             "upstream_unavailable": f"The {source} service is unavailable.",
             "upstream_response": f"The {source} service rejected the request.",
+            "upstream_busy": f"The {source} request queue is busy.",
             "unexpected_content": f"The {source} service returned unexpected content.",
             "redirect": f"The {source} service returned an unsupported redirect.",
             "unsafe_redirect": f"The {source} service redirected to an unsafe target.",
@@ -272,7 +286,23 @@ def _acquire_upstream_slot(
     cancelled: Callable[[], bool] | None = None,
     deadline: float | None = None,
 ):
-    semaphore = services["upstream_semaphore"]
+    return _acquire_semaphore(
+        services["upstream_semaphore"],
+        services,
+        source=source,
+        cancelled=cancelled,
+        deadline=deadline,
+    )
+
+
+def _acquire_semaphore(
+    semaphore: object,
+    services: Mapping[str, Any],
+    *,
+    source: str,
+    cancelled: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+):
     acquired = False
     try:
         if cancelled is None and deadline is None:
@@ -311,6 +341,19 @@ def _bounded_upstream_limit(value: object) -> int:
     except (TypeError, ValueError):
         configured = DEFAULT_UPSTREAM_CONCURRENCY
     return max(1, min(MAX_UPSTREAM_CONCURRENCY, configured))
+
+
+def _bounded_queue_timeout(value: object) -> float:
+    try:
+        configured = float(value)
+    except (TypeError, ValueError):
+        configured = DEFAULT_UPSTREAM_QUEUE_TIMEOUT_SECONDS
+    if not math.isfinite(configured):
+        configured = DEFAULT_UPSTREAM_QUEUE_TIMEOUT_SECONDS
+    return max(
+        MIN_UPSTREAM_QUEUE_TIMEOUT_SECONDS,
+        min(TOTAL_TIMEOUT_SECONDS, configured),
+    )
 
 
 def _ensure_json_safe(value: object, *, source: str) -> None:
@@ -416,7 +459,7 @@ def _response_html(response: object, source: str) -> str:
 
 
 def _recognized_search_page(html: str, hotels: Sequence[object]) -> bool:
-    if hotels:
+    if hotels or has_structural_hotel_card(html):
         return True
     normalized = html.casefold()
     return any(
@@ -465,7 +508,12 @@ def call_with_retry[T](
         try:
             return operation()
         except UpstreamError as error:
-            if attempt == 1 or not error.retryable or is_cancelled():
+            if (
+                attempt == 1
+                or not error.retryable
+                or error.code == "upstream_busy"
+                or is_cancelled()
+            ):
                 raise
             delay = 0.25 + services["rng"].uniform(0, 0.25)
             if is_cancelled():
@@ -488,14 +536,31 @@ def _request_upstream(
     services = _runtime_services(runtime)
 
     def operation() -> object:
+        queue_deadline = (
+            services["clock"]() + services["upstream_queue_timeout"]
+        )
         try:
-            with _upstream_slot(
+            semaphore = _acquire_upstream_slot(
+                services,
+                source=source,
+                cancelled=cancelled,
+                deadline=queue_deadline,
+            )
+        except UpstreamError as error:
+            if error.code == "timeout":
+                raise UpstreamError(
+                    "upstream_busy", source=source, retryable=True
+                ) from error
+            raise
+        try:
+            _raise_if_upstream_aborted(
                 services, source=source, cancelled=cancelled
-            ):
-                _raise_if_upstream_aborted(
-                    services, source=source, cancelled=cancelled
-                )
-                response = services["client_factory"]().get(url, params=dict(params))
+            )
+            client = services["client_factory"]()
+            _raise_if_upstream_aborted(
+                services, source=source, cancelled=cancelled
+            )
+            response = client.get(url, params=dict(params))
         except UpstreamError:
             raise
         except Exception as error:
@@ -504,6 +569,8 @@ def _request_upstream(
                 source=source,
                 retryable=True,
             ) from error
+        finally:
+            semaphore.release()
 
         status_code = getattr(response, "status_code", None)
         if not isinstance(status_code, int):
@@ -882,12 +949,19 @@ def _read_xotelo_rates(
             source="xotelo",
             retryable=True,
         ) from error
+    parse_error: BaseException | None = None
     try:
         payload = json.loads(body)
-    except (UnicodeDecodeError, ValueError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        parse_error = error
+        payload = None
+    _raise_if_upstream_aborted(
+        services, source="xotelo", deadline=deadline
+    )
+    if parse_error is not None:
         raise UpstreamError(
             "unexpected_content", source="xotelo", retryable=False
-        ) from error
+        ) from parse_error
     if not isinstance(payload, Mapping):
         raise UpstreamError(
             "unexpected_content", source="xotelo", retryable=False
@@ -902,11 +976,109 @@ def _read_xotelo_rates(
             "unexpected_content", source="xotelo", retryable=False
         )
     rates = result.get("rates")
-    if not isinstance(rates, list):
+    if not isinstance(rates, list) or len(rates) > XOTELO_MAX_RAW_RATES:
         raise UpstreamError(
             "unexpected_content", source="xotelo", retryable=False
         )
     return rates
+
+
+def _xotelo_text(
+    value: object, *, maximum_length: int, required: bool
+) -> str:
+    if not isinstance(value, str):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    if (
+        len(value) > maximum_length
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in value
+        )
+    ):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    cleaned = value.strip()
+    if required and not cleaned:
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    return cleaned
+
+
+def _xotelo_number(
+    value: object, *, allow_zero: bool
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as error:
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        ) from error
+    minimum_valid = number >= 0 if allow_zero else number > 0
+    if (
+        not minimum_valid
+        or not math.isfinite(number)
+        or number > XOTELO_MAX_RATE_VALUE
+    ):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    return number
+
+
+def _freeze_xotelo_rates(
+    rates: Sequence[object],
+    services: Mapping[str, Any],
+    deadline: float,
+) -> tuple[tuple[str, str, float, float], ...]:
+    by_provider: dict[str, tuple[str, str, float, float]] = {}
+    for raw_rate in rates:
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=deadline
+        )
+        if not isinstance(raw_rate, Mapping):
+            raise UpstreamError(
+                "unexpected_content", source="xotelo", retryable=False
+            )
+        name = _xotelo_text(
+            raw_rate.get("name"),
+            maximum_length=XOTELO_MAX_PROVIDER_NAME_LENGTH,
+            required=True,
+        )
+        code = _xotelo_text(
+            raw_rate.get("code", ""),
+            maximum_length=XOTELO_MAX_PROVIDER_CODE_LENGTH,
+            required=False,
+        )
+        rate = _xotelo_number(raw_rate.get("rate"), allow_zero=False)
+        tax = _xotelo_number(raw_rate.get("tax", 0), allow_zero=True)
+        provider_key = "".join(
+            character for character in name.casefold() if character.isalnum()
+        )
+        if not provider_key:
+            raise UpstreamError(
+                "unexpected_content", source="xotelo", retryable=False
+            )
+        existing = by_provider.get(provider_key)
+        if existing is None:
+            if len(by_provider) >= XOTELO_MAX_STORED_RATES:
+                raise UpstreamError(
+                    "unexpected_content", source="xotelo", retryable=False
+                )
+            by_provider[provider_key] = (name, code, rate, tax)
+        elif rate < existing[2]:
+            by_provider[provider_key] = (name, code, rate, tax)
+    _raise_if_upstream_aborted(
+        services, source="xotelo", deadline=deadline
+    )
+    return tuple(by_provider.values())
 
 
 def _request_xotelo_rates(
@@ -917,7 +1089,7 @@ def _request_xotelo_rates(
     checkout: str,
     currency: str,
     deadline: float,
-) -> list[object]:
+) -> tuple[tuple[str, str, float, float], ...]:
     response = None
     try:
         _raise_if_upstream_aborted(
@@ -960,7 +1132,12 @@ def _request_xotelo_rates(
             raise UpstreamError(
                 "upstream_response", source="xotelo", retryable=False
             )
-        return _read_xotelo_rates(response, services, deadline)
+        rates = _read_xotelo_rates(response, services, deadline)
+        frozen_rates = _freeze_xotelo_rates(rates, services, deadline)
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=deadline
+        )
+        return frozen_rates
     except UpstreamError:
         raise
     except Exception as error:
@@ -989,12 +1166,25 @@ def fetch_xotelo_prices(
     services = _runtime_services(runtime)
     cache = services["xotelo_cache"]
     key = (hotel_key, checkin, checkout, currency, "xotelo")
+    publication_deadline: float | None = None
 
     def load() -> tuple[tuple[str, str, float, float], ...]:
+        nonlocal publication_deadline
         deadline = services["clock"]() + TOTAL_TIMEOUT_SECONDS
-        semaphore = _acquire_upstream_slot(
-            services, source="xotelo", deadline=deadline
+        publication_deadline = deadline
+        xotelo_semaphore = _acquire_semaphore(
+            services["xotelo_semaphore"],
+            services,
+            source="xotelo",
+            deadline=deadline,
         )
+        try:
+            upstream_semaphore = _acquire_upstream_slot(
+                services, source="xotelo", deadline=deadline
+            )
+        except BaseException:
+            xotelo_semaphore.release()
+            raise
         outcome: dict[str, object] = {}
         finished = threading.Event()
 
@@ -1011,8 +1201,11 @@ def fetch_xotelo_prices(
             except BaseException as error:
                 outcome["error"] = error
             finally:
-                semaphore.release()
-                finished.set()
+                try:
+                    upstream_semaphore.release()
+                finally:
+                    xotelo_semaphore.release()
+                    finished.set()
 
         worker = threading.Thread(
             target=request_in_background,
@@ -1022,7 +1215,8 @@ def fetch_xotelo_prices(
         try:
             worker.start()
         except BaseException:
-            semaphore.release()
+            upstream_semaphore.release()
+            xotelo_semaphore.release()
             raise
 
         while not finished.is_set():
@@ -1035,44 +1229,37 @@ def fetch_xotelo_prices(
                 min(UPSTREAM_SEMAPHORE_POLL_SECONDS, remaining)
             )
 
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=deadline
+        )
         error = outcome.get("error")
         if isinstance(error, BaseException):
             raise error
-        rates = outcome.get("rates")
-        if not isinstance(rates, list):
+        frozen_rates = outcome.get("rates")
+        if not isinstance(frozen_rates, tuple):
             raise UpstreamError(
                 "unexpected_content", source="xotelo", retryable=False
             )
-        frozen_rates: list[tuple[str, str, float, float]] = []
-        for raw_rate in rates:
-            if not isinstance(raw_rate, Mapping) or not raw_rate.get("name"):
-                continue
-            raw_value = raw_rate.get("rate")
-            if raw_value in (None, 0):
-                continue
-            raw_tax = raw_rate.get("tax", 0)
-            if (
-                isinstance(raw_value, bool)
-                or not isinstance(raw_value, (int, float))
-                or isinstance(raw_tax, bool)
-                or not isinstance(raw_tax, (int, float))
-                or not math.isfinite(float(raw_value))
-                or not math.isfinite(float(raw_tax))
-            ):
-                raise UpstreamError(
-                    "unexpected_content", source="xotelo", retryable=False
-                )
-            frozen_rates.append(
-                (
-                    str(raw_rate["name"]),
-                    str(raw_rate.get("code", "")),
-                    float(raw_value),
-                    float(raw_tax),
-                )
-            )
-        return tuple(frozen_rates)
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=deadline
+        )
+        return frozen_rates
 
-    loaded = cache.get_or_load(key, load, ttl_seconds=XOTELO_CACHE_SECONDS)
+    def check_publication_deadline() -> None:
+        if publication_deadline is None:
+            raise UpstreamError(
+                "unexpected_content", source="xotelo", retryable=False
+            )
+        _raise_if_upstream_aborted(
+            services, source="xotelo", deadline=publication_deadline
+        )
+
+    loaded = cache.get_or_load(
+        key,
+        load,
+        ttl_seconds=XOTELO_CACHE_SECONDS,
+        before_store=check_publication_deadline,
+    )
     return {
         name: {
             "rate": rate,
@@ -1470,6 +1657,16 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         ),
     )
     upstream_limit = _bounded_upstream_limit(configured_limit)
+    configured_queue_timeout = application.config.get(
+        "UPSTREAM_QUEUE_TIMEOUT_SECONDS",
+        os.environ.get(
+            "HOTEL_FINDER_UPSTREAM_QUEUE_TIMEOUT_SECONDS",
+            DEFAULT_UPSTREAM_QUEUE_TIMEOUT_SECONDS,
+        ),
+    )
+    upstream_queue_timeout = _bounded_queue_timeout(
+        configured_queue_timeout
+    )
     search_cache = application.config.get("SEARCH_CACHE")
     if search_cache is None:
         search_cache = TTLCache(
@@ -1493,7 +1690,9 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         "provider_cache": provider_cache,
         "xotelo_cache": xotelo_cache,
         "upstream_semaphore": threading.BoundedSemaphore(upstream_limit),
+        "xotelo_semaphore": threading.BoundedSemaphore(1),
         "upstream_limit": upstream_limit,
+        "upstream_queue_timeout": upstream_queue_timeout,
         "job_manager": job_manager,
         "clock": clock,
         "sleep": configured("SLEEP", time.sleep),

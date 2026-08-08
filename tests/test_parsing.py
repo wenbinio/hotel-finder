@@ -1,4 +1,9 @@
-from hotel_finder.parsing import ParseContext, parse_hotel_cards, parse_provider_prices
+from hotel_finder.parsing import (
+    ParseContext,
+    has_structural_hotel_card,
+    parse_hotel_cards,
+    parse_provider_prices,
+)
 
 
 def test_hotel_card_extracts_star_price_and_metadata():
@@ -115,3 +120,17 @@ def test_hotel_parser_skips_malformed_price_without_aborting_later_cards():
 
     assert [hotel["name"] for hotel in hotels] == ["Valid Price Hotel"]
     assert hotels[0]["price"] == 240.0
+
+
+def test_structural_hotel_card_recognition_is_independent_of_business_filters():
+    filtered_cards = """
+    <div class="uaTTDe"><h2 class="BgYkof">Three Star Hotel</h2>
+    <span class="ne5qie Ih19Ad">3-star hotel</span><span>$120</span></div>
+    <div class="uaTTDe"><h2 class="BgYkof">Over Budget Hotel</h2>
+    <span class="ne5qie Ih19Ad">5-star hotel</span><span>$1,501</span></div>
+    """
+
+    assert has_structural_hotel_card(filtered_cards) is True
+    assert has_structural_hotel_card(
+        '<div class="uaTTDe">Scheduled maintenance</div>'
+    ) is False

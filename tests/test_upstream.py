@@ -18,6 +18,7 @@ from app import (
     fetch_xotelo_prices,
     search_hotels,
 )
+from hotel_finder.cache import TTLCache
 
 HOTEL_HTML = """
 <html><body><div class="uaTTDe">
@@ -140,6 +141,21 @@ class BlockingHeaderClient:
         return self.response
 
 
+class SaturatedXoteloClient:
+    def __init__(self):
+        self.calls = 0
+        self.lock = threading.Lock()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def get(self, _url, **_kwargs):
+        with self.lock:
+            self.calls += 1
+            self.started.set()
+        self.release.wait(1)
+        return JsonResponse({"result": {"rates": []}})
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -149,6 +165,34 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+class PublicationDelayCache(TTLCache):
+    def __init__(self, clock):
+        super().__init__(max_entries=8, ttl_seconds=900, clock=clock)
+        self.clock = clock
+        self.delay_next_publication = True
+
+    def get_or_load(
+        self, key, loader, ttl_seconds=None, *, before_store=None
+    ):
+        def delayed_loader():
+            value = loader()
+            if self.delay_next_publication:
+                self.delay_next_publication = False
+                self.clock.advance(16)
+            return value
+
+        if before_store is None:
+            return super().get_or_load(
+                key, delayed_loader, ttl_seconds=ttl_seconds
+            )
+        return super().get_or_load(
+            key,
+            delayed_loader,
+            ttl_seconds=ttl_seconds,
+            before_store=before_store,
+        )
 
 
 class DeterministicRng:
@@ -376,7 +420,7 @@ def test_genuine_empty_search_is_cached_for_only_sixty_seconds(app_factory):
     assert len(client.calls) == 2
 
 
-def test_filtered_search_card_without_no_results_marker_is_not_cached_as_empty(
+def test_structural_search_card_filtered_by_stars_is_cached_as_empty(
     app_factory,
 ):
     html = """
@@ -385,17 +429,37 @@ def test_filtered_search_card_without_no_results_marker_is_not_cached_as_empty(
       <span class="ne5qie Ih19Ad">3-star hotel</span><span>$120</span>
     </div></body></html>
     """
-    client = SequenceClient([FakeResponse(text=html), FakeResponse()])
+    client = SequenceClient([FakeResponse(text=html)])
     application = app_factory(CLIENT_FACTORY=lambda: client)
 
     with application.app_context():
-        with pytest.raises(UpstreamError) as caught:
-            search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
-        recovered = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        first = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        cached = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
 
-    assert caught.value.code == "unexpected_content"
-    assert recovered[0]["name"] == "Test Grand Hotel"
-    assert len(client.calls) == 2
+    assert first == []
+    assert cached == []
+    assert len(client.calls) == 1
+
+
+def test_structural_search_card_filtered_by_price_is_cached_as_empty(
+    app_factory,
+):
+    html = """
+    <html><body><div class="uaTTDe">
+      <h2 class="BgYkof">Over Budget Hotel</h2>
+      <span class="ne5qie Ih19Ad">5-star hotel</span><span>$1,501</span>
+    </div></body></html>
+    """
+    client = SequenceClient([FakeResponse(text=html)])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        first = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        cached = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+
+    assert first == []
+    assert cached == []
+    assert len(client.calls) == 1
 
 
 def test_lone_google_result_wrapper_is_not_proof_of_genuine_empty(app_factory):
@@ -726,6 +790,130 @@ def test_xotelo_slow_stream_fails_at_elapsed_deadline_and_is_not_cached(
     assert len(client.calls) == 2
 
 
+def test_xotelo_parse_crossing_deadline_is_not_returned_or_cached(
+    app_factory, monkeypatch
+):
+    clock = FakeClock()
+    expired = JsonResponse({"result": {"rates": []}})
+    valid = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0}
+            ]
+        }
+    }
+    client = SequenceClient([expired, JsonResponse(valid)])
+    original_loads = app_module.json.loads
+    parse_calls = 0
+
+    def advancing_loads(body):
+        nonlocal parse_calls
+        parse_calls += 1
+        parsed = original_loads(body)
+        if parse_calls == 1:
+            clock.advance(16)
+        return parsed
+
+    monkeypatch.setattr(app_module.json, "loads", advancing_loads)
+    application = app_factory(CLOCK=clock, XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "timeout"
+    assert expired.closed is True
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
+def test_xotelo_malformed_parse_crossing_deadline_reports_timeout(
+    app_factory, monkeypatch
+):
+    clock = FakeClock()
+    response = JsonResponse({"result": {"rates": []}})
+
+    def failing_loads(_body):
+        clock.advance(16)
+        raise ValueError("malformed")
+
+    monkeypatch.setattr(app_module.json, "loads", failing_loads)
+    application = app_factory(CLOCK=clock)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        app_module._read_xotelo_rates(
+            response,
+            application.extensions["hotel_finder"],
+            deadline=15,
+        )
+
+    assert caught.value.code == "timeout"
+
+
+def test_xotelo_recursion_error_is_malformed_content(app_factory, monkeypatch):
+    response = JsonResponse({"result": {"rates": []}})
+    client = SequenceClient([response])
+
+    def recursive_loads(_body):
+        raise RecursionError("nested too deeply")
+
+    monkeypatch.setattr(app_module.json, "loads", recursive_loads)
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert caught.value.retryable is False
+    assert response.closed is True
+
+
+def test_xotelo_publication_crossing_deadline_is_not_returned_or_cached(
+    app_factory,
+):
+    clock = FakeClock()
+    cache = PublicationDelayCache(clock)
+    expired = JsonResponse({"result": {"rates": []}})
+    valid = JsonResponse(
+        {
+            "result": {
+                "rates": [
+                    {
+                        "name": "Agoda",
+                        "code": "Agoda",
+                        "rate": 88.0,
+                    }
+                ]
+            }
+        }
+    )
+    client = SequenceClient([expired, valid])
+    application = app_factory(
+        CLOCK=clock, XOTELO_CACHE=cache, XOTELO_CLIENT=client
+    )
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        assert cache.size() == 0
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "timeout"
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
 def test_xotelo_header_wait_obeys_hard_deadline_without_releasing_live_slot(
     app_factory, monkeypatch
 ):
@@ -750,6 +938,119 @@ def test_xotelo_header_wait_obeys_hard_deadline_without_releasing_live_slot(
     assert gate.acquire(timeout=1)
     gate.release()
     assert response.closed is True
+
+
+def test_google_queue_deadline_survives_a_retained_xotelo_permit_and_recovers(
+    app_factory, monkeypatch
+):
+    monkeypatch.setattr(app_module, "TOTAL_TIMEOUT_SECONDS", 0.05)
+    xotelo_response = JsonResponse({"result": {"rates": []}})
+    xotelo = BlockingHeaderClient(xotelo_response)
+    google = SequenceClient([FakeResponse()])
+    sleeps = []
+    application = app_factory(
+        XOTELO_CLIENT=xotelo,
+        CLIENT_FACTORY=lambda: google,
+        UPSTREAM_CONCURRENCY=1,
+        UPSTREAM_QUEUE_TIMEOUT_SECONDS=0.03,
+        SLEEP=sleeps.append,
+    )
+    gate = application.extensions["hotel_finder"]["upstream_semaphore"]
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as xotelo_error:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+
+        started_at = time.monotonic()
+        with pytest.raises(UpstreamError) as google_error:
+            search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        elapsed = time.monotonic() - started_at
+
+        assert xotelo_error.value.code == "timeout"
+        assert google_error.value.code == "upstream_busy"
+        assert google_error.value.retryable is True
+        assert elapsed < 0.12
+        assert xotelo.finished.is_set() is False
+        assert google.calls == []
+        assert sleeps == []
+
+        assert xotelo.finished.wait(1)
+        assert gate.acquire(timeout=1)
+        gate.release()
+        recovered = search_hotels(
+            "Bangkok", "2026-08-10", "2026-08-11", 5
+        )
+
+    assert recovered[0]["name"] == "Test Grand Hotel"
+    assert len(google.calls) == 1
+    assert xotelo_response.closed is True
+
+
+def test_xotelo_bulkhead_keeps_google_available_under_saturation(
+    app_factory, monkeypatch
+):
+    monkeypatch.setattr(app_module, "TOTAL_TIMEOUT_SECONDS", 0.05)
+    xotelo = SaturatedXoteloClient()
+    google = SequenceClient([FakeResponse()])
+    application = app_factory(
+        XOTELO_CLIENT=xotelo,
+        CLIENT_FACTORY=lambda: google,
+        UPSTREAM_CONCURRENCY=4,
+        UPSTREAM_QUEUE_TIMEOUT_SECONDS=0.03,
+    )
+    services = application.extensions["hotel_finder"]
+
+    def fetch_one(index):
+        with application.app_context():
+            try:
+                fetch_xotelo_prices(
+                    f"ta-key-{index}",
+                    "Hotel",
+                    "2026-08-10",
+                    "2026-08-11",
+                )
+            except UpstreamError as error:
+                return error.code
+        return "unexpected-success"
+
+    pool = ThreadPoolExecutor(max_workers=4)
+    futures = [pool.submit(fetch_one, index) for index in range(4)]
+    total_gate = services["upstream_semaphore"]
+    xotelo_gate = services["xotelo_semaphore"]
+    acquired_total = 0
+    acquired_xotelo = False
+    try:
+        assert xotelo.started.wait(1)
+        assert [future.result(timeout=1) for future in futures] == [
+            "timeout",
+            "timeout",
+            "timeout",
+            "timeout",
+        ]
+        with application.app_context():
+            hotels = search_hotels(
+                "Bangkok", "2026-08-10", "2026-08-11", 5
+            )
+
+        assert xotelo.calls == 1
+        assert hotels[0]["name"] == "Test Grand Hotel"
+        assert len(google.calls) == 1
+    finally:
+        xotelo.release.set()
+        pool.shutdown(wait=True)
+        for _index in range(4):
+            if total_gate.acquire(timeout=1):
+                acquired_total += 1
+        acquired_xotelo = xotelo_gate.acquire(timeout=1)
+        for _index in range(acquired_total):
+            total_gate.release()
+        if acquired_xotelo:
+            xotelo_gate.release()
+
+    assert acquired_total == 4
+    assert acquired_xotelo is True
 
 
 def test_xotelo_oversized_stream_is_rejected_without_caching(app_factory):
@@ -844,6 +1145,185 @@ def test_xotelo_rejects_malformed_shape_without_caching_it(
     client = SequenceClient(
         [JsonResponse(malformed_payload), JsonResponse(valid_payload)]
     )
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
+def test_xotelo_rejects_missing_provider_name_without_caching_it(app_factory):
+    malformed = {
+        "result": {"rates": [{"code": "Agoda", "rate": 88.0}]}
+    }
+    valid = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0}
+            ]
+        }
+    }
+    client = SequenceClient([JsonResponse(malformed), JsonResponse(valid)])
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "malformed_rate",
+    [
+        "not-an-object",
+        {"name": "", "code": "Agoda", "rate": 88.0},
+        {"name": "   ", "code": "Agoda", "rate": 88.0},
+        {"name": "Bad\nProvider", "code": "Agoda", "rate": 88.0},
+        {"name": "\tAgoda", "code": "Agoda", "rate": 88.0},
+        {"name": "Agoda\n", "code": "Agoda", "rate": 88.0},
+        {"name": " " * 256 + "Agoda", "code": "Agoda", "rate": 88.0},
+        {"name": "A" * 129, "code": "Agoda", "rate": 88.0},
+        {"name": "Agoda", "code": 7, "rate": 88.0},
+        {"name": "Agoda", "code": "A" * 65, "rate": 88.0},
+        {"name": "Agoda", "code": "Bad\tCode", "rate": 88.0},
+        {"name": "Agoda", "code": "\tAgoda", "rate": 88.0},
+        {"name": "Agoda", "code": "Agoda\n", "rate": 88.0},
+        {"name": "Agoda", "code": " " * 256 + "Agoda", "rate": 88.0},
+        {"name": "Agoda", "code": "Agoda", "rate": True},
+        {"name": "Agoda", "code": "Agoda", "rate": 0},
+        {"name": "Agoda", "code": "Agoda", "rate": -1},
+        {"name": "Agoda", "code": "Agoda", "rate": 1_000_001},
+        {"name": "Agoda", "code": "Agoda", "rate": 10**400},
+        {"name": "Agoda", "code": "Agoda", "rate": 88.0, "tax": -1},
+        {
+            "name": "Agoda",
+            "code": "Agoda",
+            "rate": 88.0,
+            "tax": 1_000_001,
+        },
+    ],
+)
+def test_xotelo_rejects_invalid_inner_rate_records(
+    app_factory, malformed_rate
+):
+    client = SequenceClient(
+        [JsonResponse({"result": {"rates": [malformed_rate]}})]
+    )
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+
+
+def test_xotelo_rejects_large_raw_rate_amplification_without_caching(
+    app_factory,
+):
+    amplified = JsonResponse(
+        {
+            "result": {
+                "rates": [
+                    {"name": "A", "code": "A", "rate": 1}
+                    for _index in range(18_000)
+                ]
+            }
+        }
+    )
+    assert len(amplified.body) < 1_000_000
+    valid = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0}
+            ]
+        }
+    }
+    client = SequenceClient([amplified, JsonResponse(valid)])
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+
+
+def test_xotelo_deduplicates_normalized_providers_before_caching(app_factory):
+    payload = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 90.0},
+                {"name": " agoda ", "code": "Agoda", "rate": 88.0},
+                {"name": "AGO.DA", "code": "Agoda", "rate": 80.0},
+            ]
+        }
+    }
+    client = SequenceClient([JsonResponse(payload)])
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        first = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+        cached = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert len(first) == 1
+    assert next(iter(first.values()))["rate"] == 80.0
+    assert cached == first
+    assert len(client.calls) == 1
+
+
+def test_xotelo_rejects_too_many_normalized_providers_without_caching(
+    app_factory,
+):
+    too_many = {
+        "result": {
+            "rates": [
+                {
+                    "name": f"Provider {index}",
+                    "code": "Agoda",
+                    "rate": float(index + 1),
+                }
+                for index in range(129)
+            ]
+        }
+    }
+    valid = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0}
+            ]
+        }
+    }
+    client = SequenceClient([JsonResponse(too_many), JsonResponse(valid)])
     application = app_factory(XOTELO_CLIENT=client)
 
     with application.app_context():

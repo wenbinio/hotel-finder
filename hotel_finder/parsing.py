@@ -111,6 +111,9 @@ PROVIDER_NAMES = (
     ("Traveloka", "traveloka"),
     ("Official Site", "official"),
 )
+PRICE_PATTERN = re.compile(
+    r"\$((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+))(?![0-9,])"
+)
 
 
 @dataclass(frozen=True)
@@ -175,6 +178,31 @@ def _normalized_url(card: Any) -> str | None:
     return href or None
 
 
+def _parse_price(card: Any) -> float | None:
+    price_match = PRICE_PATTERN.search(card.text())
+    if price_match is None:
+        return None
+    try:
+        return float(price_match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def has_structural_hotel_card(html: str) -> bool:
+    """Return whether Google markup contains a complete card before filters."""
+    parser = LexborHTMLParser(html)
+    for card in parser.css("div.uaTTDe"):
+        name_node = card.css_first("h2.BgYkof") or card.css_first("h2.Cx32Ud")
+        if name_node is None:
+            continue
+        name = name_node.text(strip=True)
+        if not name or (_html_star_class(card) is None and brand_star_class(name) is None):
+            continue
+        if _parse_price(card) is not None:
+            return True
+    return False
+
+
 def parse_hotel_cards(html: str, context: ParseContext) -> list[dict[str, Any]]:
     """Extract bounded, display-ready hotel records from Google Hotels HTML."""
     parser = LexborHTMLParser(html)
@@ -188,14 +216,8 @@ def parse_hotel_cards(html: str, context: ParseContext) -> list[dict[str, Any]]:
         star_class = html_star or brand_star_class(name)
         if star_class is None or star_class < context.min_stars:
             continue
-        price_match = re.search(
-            r"\$((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+))(?![0-9,])", card.text()
-        )
-        if price_match is None:
-            continue
-        try:
-            price = float(price_match.group(1).replace(",", ""))
-        except ValueError:
+        price = _parse_price(card)
+        if price is None:
             continue
         if price > 1500:
             continue

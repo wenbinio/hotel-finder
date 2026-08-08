@@ -43,6 +43,28 @@ def test_get_or_load_coalesces_same_key() -> None:
     assert sum(not result.hit for result in results) == 1
 
 
+def test_get_or_load_before_store_can_abort_publication() -> None:
+    cache = TTLCache(max_entries=8, ttl_seconds=60)
+    events = []
+
+    def loader() -> str:
+        events.append("loaded")
+        return "late"
+
+    def reject_store() -> None:
+        events.append("checked")
+        raise RuntimeError("deadline crossed")
+
+    with pytest.raises(RuntimeError, match="deadline crossed"):
+        cache.get_or_load("same", loader, before_store=reject_store)
+
+    assert events == ["loaded", "checked"]
+    assert cache.get("same") is None
+    assert cache.get_or_load("same", lambda: "recovered") == CacheResult(
+        value="recovered", hit=False
+    )
+
+
 def test_persistent_failure_is_shared_once_by_the_waiting_cohort_then_retryable() -> None:
     cache = TTLCache(max_entries=8, ttl_seconds=60)
     owner_started = Event()
