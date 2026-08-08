@@ -3,7 +3,8 @@ function completedCount(progress) {
 }
 
 function totalCount(progress) {
-  return Math.max(1, Number(progress?.total ?? progress?.totalCount ?? 0))
+  const total = Number(progress?.total ?? progress?.totalCount)
+  return Number.isFinite(total) && total > 0 ? total : null
 }
 
 function partialPrice(item) {
@@ -44,16 +45,23 @@ export default function SweepProgress({ job, onCancel }) {
       <div className="table-header">
         <h2 id="sweep-progress-title">Date sweep {job.status}</h2>
         {cancellable && jobId && (
-          <button className="cancel-btn" type="button" onClick={() => onCancel?.(jobId)}>
-            Cancel sweep
+          <button
+            className="cancel-btn"
+            type="button"
+            disabled={job.cancelRequested}
+            onClick={() => onCancel?.(jobId)}
+          >
+            {job.cancelRequested ? 'Cancellation requested' : 'Cancel sweep'}
           </button>
         )}
       </div>
       <p className="progress-status" role="status" aria-live="polite">
-        {completed} of {total} searches complete
+        {total === null ? 'Waiting for progress details' : `${completed} of ${total} searches complete`}
         {progress.currentLocation ? `; searching ${progress.currentLocation}` : ''}.
       </p>
-      <progress value={Math.min(completed, total)} max={total}>{completed} of {total}</progress>
+      {total === null
+        ? <progress>Waiting for progress details</progress>
+        : <progress value={Math.min(completed, total)} max={total}>{completed} of {total}</progress>}
       {partial.length > 0 && (
         <ul className="prog-results" aria-label="Completed date summaries">
           {partial.map(item => {

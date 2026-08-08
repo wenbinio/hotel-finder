@@ -11,6 +11,7 @@ import { stableHotelKey } from './lib/pricing'
 
 const POLL_DELAY_MS = 750
 const ACTIVE_SWEEP_STATUSES = new Set(['queued', 'running'])
+const TERMINAL_SWEEP_STATUSES = new Set(['cancelled', 'completed', 'failed'])
 
 function isAbort(error) {
   return error?.name === 'AbortError'
@@ -32,12 +33,73 @@ function warningText(warning) {
   }
 }
 
-function responseWarnings(response) {
-  return [
-    ...(response?.warnings || []),
-    ...(response?.failedDestinations || []),
-    ...(response?.failedHotels || []),
-  ].map(warningText).filter(Boolean)
+function warningRecord(warning) {
+  if (typeof warning === 'string') {
+    const text = warning.trim()
+    return text ? { identity: JSON.stringify(['message', text.toLocaleLowerCase()]), text } : null
+  }
+
+  const code = typeof warning?.code === 'string' ? warning.code.trim() : ''
+  const location = typeof warning?.location === 'string' ? warning.location.trim() : ''
+  const message = typeof warning?.message === 'string' ? warning.message.trim() : ''
+  const text = message || [location, code].filter(Boolean).join(': ') || warningText(warning)
+  if (!text) return null
+
+  const semanticParts = [code.toLocaleLowerCase(), location.toLocaleLowerCase()]
+  const identity = code || location
+    ? JSON.stringify(['structured', ...semanticParts])
+    : JSON.stringify(['message', text.toLocaleLowerCase()])
+  return { identity, text, qualifier: [location, code].filter(Boolean).join(' — ') }
+}
+
+function responseWarningRecords(response) {
+  const values = ['warnings', 'failedDestinations', 'failedHotels']
+    .flatMap(field => {
+      const value = response?.[field]
+      if (value === null || value === undefined) return []
+      return Array.isArray(value) ? value : [value]
+    })
+  const unique = new Map()
+  for (const value of values) {
+    const record = warningRecord(value)
+    if (record && !unique.has(record.identity)) unique.set(record.identity, record)
+  }
+
+  return [...unique.values()]
+}
+
+function warningMessages(...groups) {
+  const unique = new Map()
+  for (const record of groups.flat()) {
+    if (record && !unique.has(record.identity)) unique.set(record.identity, record)
+  }
+  const records = [...unique.values()]
+  const textCounts = new Map()
+  for (const record of records) {
+    const normalizedText = record.text.toLocaleLowerCase()
+    textCounts.set(normalizedText, (textCounts.get(normalizedText) || 0) + 1)
+  }
+
+  return records.map(record => {
+    const hasDuplicateText = textCounts.get(record.text.toLocaleLowerCase()) > 1
+    return hasDuplicateText && record.qualifier
+      ? `${record.text} (${record.qualifier})`
+      : record.text
+  })
+}
+
+function hasHotels(results) {
+  if (Array.isArray(results)) return results.length > 0
+  return results && typeof results === 'object'
+    ? Object.values(results).some(hotels => Array.isArray(hotels) && hotels.length > 0)
+    : false
+}
+
+function sweepFailureMessage(snapshot) {
+  const message = snapshot?.error?.message
+  const code = snapshot?.error?.code
+  if (message) return code ? `${message} (${code})` : message
+  return warningText(snapshot?.warnings?.[0]) || 'The sweep stopped before completing'
 }
 
 function normalizeSearchResult(response, query) {
@@ -94,14 +156,26 @@ function abortCurrent(begin) {
   replacement.finish()
 }
 
+function applySweepSnapshot(previous, snapshot) {
+  if (!previous) return snapshot
+  if (previous.jobId && snapshot.jobId && previous.jobId !== snapshot.jobId) return previous
+  if (TERMINAL_SWEEP_STATUSES.has(previous.status)) return previous
+  return {
+    ...snapshot,
+    cancelRequested: Boolean(previous.cancelRequested || snapshot.cancelRequested),
+  }
+}
+
 export default function App() {
-  const [destinations, setDestinations] = useState({})
+  const [destinations, setDestinations] = useState(null)
+  const [destinationsStatus, setDestinationsStatus] = useState('loading')
   const [query, setQuery] = useState(null)
   const [result, setResult] = useState(null)
   const [searching, setSearching] = useState(false)
   const [comparing, setComparing] = useState(false)
   const [error, setError] = useState(null)
-  const [warnings, setWarnings] = useState([])
+  const [searchWarnings, setSearchWarnings] = useState([])
+  const [comparisonWarnings, setComparisonWarnings] = useState([])
   const [sweepJob, setSweepJob] = useState(null)
   const [tab, setTab] = useState('beachfront')
   const [sortKey, setSortKey] = useState('price')
@@ -130,9 +204,13 @@ export default function App() {
     async function loadDestinations() {
       try {
         const response = await fetchJson('/api/destinations', { signal: request.signal })
-        if (request.isCurrent()) setDestinations(response)
+        if (request.isCurrent()) {
+          setDestinations(response)
+          setDestinationsStatus('ready')
+        }
       } catch (loadError) {
         if (request.isCurrent() && !isAbort(loadError)) {
+          setDestinationsStatus('failed')
           setError({ operation: 'Destination loading', message: messageFor(loadError) })
         }
       } finally {
@@ -144,8 +222,12 @@ export default function App() {
   }, [beginDestinations])
 
   const applySweepResult = useCallback(sweepResult => {
-    if (!sweepResult?.bestDateResults) return
-    const cheapestDate = sweepResult.cheapestDate || {}
+    const cheapestDate = sweepResult?.cheapestDate
+    if (!cheapestDate?.checkin || !cheapestDate?.checkout || !hasHotels(sweepResult.bestDateResults)) {
+      setResult(null)
+      setQuery(null)
+      return
+    }
     const nextResult = {
       checkin: cheapestDate.checkin,
       checkout: cheapestDate.checkout,
@@ -170,7 +252,7 @@ export default function App() {
       const snapshot = await getSweep(jobId, request.signal)
       if (!request.isCurrent()) return
 
-      setSweepJob(snapshot)
+      setSweepJob(previous => applySweepSnapshot(previous, snapshot))
 
       if (ACTIVE_SWEEP_STATUSES.has(snapshot.status)) {
         pollTimer.current = setTimeout(() => {
@@ -180,11 +262,12 @@ export default function App() {
         return
       }
 
+      setError(previous => previous?.operation === 'Sweep cancellation' ? null : previous)
       if (snapshot.status === 'completed') applySweepResult(snapshot.result)
       if (snapshot.status === 'failed') {
         setError({
           operation: 'Date sweep',
-          message: warningText(snapshot.warnings?.[0]) || 'The sweep stopped before completing',
+          message: sweepFailureMessage(snapshot),
         })
       }
       request.finish()
@@ -215,7 +298,10 @@ export default function App() {
     const request = beginSearch()
     setSearching(true)
     setError(null)
-    setWarnings([])
+    setQuery(null)
+    setResult(null)
+    setSearchWarnings([])
+    setComparisonWarnings([])
 
     try {
       const endpoint = searchQuery.location ? '/api/search' : '/api/search-all'
@@ -229,7 +315,7 @@ export default function App() {
       const nextResult = normalizeSearchResult(response, searchQuery)
       setQuery(searchQuery)
       setResult(nextResult)
-      setWarnings(responseWarnings(response))
+      setSearchWarnings(responseWarningRecords(response))
       setTab(initialTab(nextResult))
       setSortKey('price')
     } catch (searchError) {
@@ -248,6 +334,7 @@ export default function App() {
     const request = beginComparison()
     setComparing(true)
     setError(null)
+    setComparisonWarnings([])
 
     try {
       const response = await fetchJson('/api/compare-prices', {
@@ -261,7 +348,7 @@ export default function App() {
       })
       if (!request.isCurrent()) return
       setResult(previous => mergeComparison(previous, response.hotels))
-      setWarnings(responseWarnings(response))
+      setComparisonWarnings(responseWarningRecords(response))
     } catch (compareError) {
       if (request.isCurrent() && !isAbort(compareError)) {
         setError({ operation: 'Provider comparison', message: messageFor(compareError) })
@@ -284,7 +371,10 @@ export default function App() {
     sweepInput.current = parameters
     setSweepJob({ jobId: null, status: 'queued' })
     setError(null)
-    setWarnings([])
+    setQuery(null)
+    setResult(null)
+    setSearchWarnings([])
+    setComparisonWarnings([])
 
     try {
       const created = await createSweep(parameters, request.signal)
@@ -311,14 +401,8 @@ export default function App() {
       if (!request.isCurrent()) return
       setSweepJob(previous => {
         if (!previous || previous.jobId !== jobId) return previous
-        return {
-          ...previous,
-          ...cancellation,
-          progress: cancellation.progress || previous.progress,
-          partial: cancellation.partial || previous.partial,
-          result: cancellation.result ?? previous.result,
-          warnings: cancellation.warnings || previous.warnings,
-        }
+        if (TERMINAL_SWEEP_STATUSES.has(previous.status)) return previous
+        return { ...previous, cancelRequested: cancellation.cancelRequested ?? true }
       })
     } catch (cancelError) {
       if (request.isCurrent() && !isAbort(cancelError)) {
@@ -333,6 +417,11 @@ export default function App() {
   const groups = groupedHotels(result)
   const displayedHotels = groups ? (groups[tab] || []) : (result?.results || [])
   const nights = query?.nights || 1
+  const warnings = warningMessages(searchWarnings, comparisonWarnings)
+  const emptySweepResult = sweepJob?.status === 'completed'
+    && (!sweepJob.result?.cheapestDate || !hasHotels(sweepJob.result?.bestDateResults))
+  const emptySweepStart = sweepJob?.result?.startDate || sweepInput.current?.startDate
+  const emptySweepEnd = sweepJob?.result?.endDate || sweepInput.current?.endDate
 
   return (
     <main className="app">
@@ -342,9 +431,14 @@ export default function App() {
       </header>
 
       <fieldset className="operation-group" disabled={sweepActive} aria-label="Hotel search controls">
-        <SearchPanel onSubmit={handleSearch} />
+        <SearchPanel destinations={destinations || {}} onSubmit={handleSearch} />
       </fieldset>
-      <DateSweep destinations={destinations} onSubmit={handleSweep} loading={sweepActive} />
+      {destinationsStatus === 'loading' && (
+        <p className="operation-status" role="status">Loading destinations…</p>
+      )}
+      {destinationsStatus === 'ready' && (
+        <DateSweep destinations={destinations} onSubmit={handleSweep} loading={sweepActive} />
+      )}
 
       {searching && <p className="operation-status" role="status">Searching for hotels…</p>}
       {comparing && <p className="operation-status" role="status">Comparing provider prices…</p>}
@@ -359,6 +453,13 @@ export default function App() {
         <p className="operation-status" role="status">Cancellation requested…</p>
       )}
       {sweepJob?.status === 'completed' && <DateChart data={sweepJob.result} />}
+      {emptySweepResult && (
+        <p className="empty" role="status">
+          {emptySweepStart && emptySweepEnd
+            ? `No priced hotel results were found from ${emptySweepStart} to ${emptySweepEnd}.`
+            : 'No priced hotel results were found for the requested date range.'}
+        </p>
+      )}
 
       {result && query && (
         <>

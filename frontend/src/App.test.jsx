@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -177,6 +177,170 @@ describe('latest search and comparison ownership', () => {
       hotels: [currentHotel],
     })
   })
+
+  it('deduplicates warning fields by semantic identity before rendering stable keys', async () => {
+    const user = userEvent.setup()
+    const duplicateKeyError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warning = {
+      code: 'timeout', location: 'Phuket', message: 'Phuket provider timed out',
+    }
+    api.fetchJson.mockImplementation((path, options) => {
+      if (path === '/api/destinations') return Promise.resolve(DESTINATIONS)
+      if (path === '/api/search-all') {
+        return Promise.resolve({
+          ...searchResult(options.body, hotel('Warning Hotel', 'Phuket', 180, 'warning')),
+          warnings: [warning, { ...warning }],
+          failedDestinations: [{
+            code: 'timeout', location: 'Phuket', message: 'A second summary of the same timeout',
+          }],
+        })
+      }
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+
+    try {
+      await renderReady()
+      await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+
+      const warningList = await screen.findByRole('list', { name: 'Search warnings' })
+      expect(within(warningList).getAllByRole('listitem')).toHaveLength(1)
+      expect(warningList).toHaveTextContent('Phuket provider timed out')
+      expect(duplicateKeyError.mock.calls.flat().join(' ')).not.toMatch(/same key|unique key/i)
+    } finally {
+      duplicateKeyError.mockRestore()
+    }
+  })
+
+  it('routes accessible single-destination and all-destination searches with their submitted payloads', async () => {
+    const user = userEvent.setup()
+    const singleHotel = hotel('Exact Phuket Hotel', 'Phuket', 170, 'exact-phuket')
+    const allHotel = hotel('All Destinations Hotel', 'Bangkok', 190, 'all-destinations')
+    api.fetchJson.mockImplementation((path, options) => {
+      if (path === '/api/destinations') return Promise.resolve(DESTINATIONS)
+      if (path === '/api/search') {
+        return Promise.resolve({
+          location: options.body.location,
+          checkin: options.body.checkin,
+          checkout: options.body.checkout,
+          hotels: [singleHotel],
+        })
+      }
+      if (path === '/api/search-all') return Promise.resolve(searchResult(options.body, allHotel))
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+    await renderReady()
+
+    await user.selectOptions(screen.getByLabelText('Search scope'), 'single')
+    await user.selectOptions(screen.getByLabelText('Destination'), 'Phuket')
+    await user.click(screen.getByRole('button', { name: /search one destination/i }))
+
+    expect(await screen.findByText('Exact Phuket Hotel')).toBeInTheDocument()
+    const singleCall = api.fetchJson.mock.calls.find(([path]) => path === '/api/search')
+    expect(singleCall[1].body).toMatchObject({
+      location: 'Phuket', minStars: 5, maxFlight: 300, nights: 5,
+    })
+
+    await user.selectOptions(screen.getByLabelText('Search scope'), 'all')
+    await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+
+    expect(await screen.findByText('All Destinations Hotel')).toBeInTheDocument()
+    const allCall = api.fetchJson.mock.calls.findLast(([path]) => path === '/api/search-all')
+    expect(allCall[1].body).not.toHaveProperty('location')
+  })
+
+  it('clears the previous result as soon as a superseding search starts and keeps it clear on failure', async () => {
+    const user = userEvent.setup()
+    const newerSearch = deferred()
+    api.fetchJson.mockImplementation((path, options) => {
+      if (path === '/api/destinations') return Promise.resolve(DESTINATIONS)
+      if (path === '/api/search-all') {
+        if (options.body.checkin === '2026-10-20') return newerSearch.promise
+        return Promise.resolve(searchResult(
+          options.body,
+          hotel('Previous Result', 'Phuket', 180, 'previous-result'),
+        ))
+      }
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+    await renderReady()
+
+    setSearchDates('2026-09-10', '2026-09-15')
+    await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+    expect(await screen.findByText('Previous Result')).toBeInTheDocument()
+
+    setSearchDates('2026-10-20', '2026-10-25')
+    await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+    expect(screen.queryByText('Previous Result')).not.toBeInTheDocument()
+    expect(screen.queryByText(/^Stay:/)).not.toBeInTheDocument()
+
+    await act(async () => newerSearch.reject(new Error('new search failed')))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Hotel search failed: new search failed')
+    expect(screen.queryByText('Previous Result')).not.toBeInTheDocument()
+  })
+
+  it('preserves search partial warnings after a successful provider comparison', async () => {
+    const user = userEvent.setup()
+    const currentHotel = hotel('Warning Merge Hotel', 'Phuket', 180, 'warning-merge')
+    api.fetchJson.mockImplementation((path, options) => {
+      if (path === '/api/destinations') return Promise.resolve(DESTINATIONS)
+      if (path === '/api/search-all') {
+        return Promise.resolve({
+          ...searchResult(options.body, currentHotel),
+          failedDestinations: [{
+            code: 'timeout', location: 'Bangkok', message: 'Bangkok search timed out',
+          }],
+        })
+      }
+      if (path === '/api/compare-prices') {
+        return Promise.resolve({
+          hotels: [{ ...currentHotel, providers: { Agoda: { rate: 160 } } }],
+          warnings: [{
+            code: 'rate_limited', location: 'Phuket', message: 'One provider was rate limited',
+          }],
+        })
+      }
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+    await renderReady()
+
+    await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+    expect(await screen.findByText('Bangkok search timed out')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /compare top 15 providers/i }))
+
+    const warningList = await screen.findByRole('list', { name: 'Search warnings' })
+    expect(within(warningList).getAllByRole('listitem')).toHaveLength(2)
+    expect(warningList).toHaveTextContent('Bangkok search timed out')
+    expect(warningList).toHaveTextContent('One provider was rate limited')
+  })
+})
+
+describe('destination loading', () => {
+  it('shows a loading status without announcing sweep validation before destinations arrive', () => {
+    api.fetchJson.mockImplementation(path => {
+      if (path === '/api/destinations') return new Promise(() => {})
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+
+    render(<App />)
+
+    expect(screen.getByText('Loading destinations…')).toHaveAttribute('role', 'status')
+    expect(screen.queryByRole('heading', { name: /find cheapest dates/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('shows only the destination operation error when loading fails', async () => {
+    api.fetchJson.mockImplementation(path => {
+      if (path === '/api/destinations') return Promise.reject(new Error('destination service offline'))
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+
+    render(<App />)
+
+    const alerts = await screen.findAllByRole('alert')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toHaveTextContent('Destination loading failed: destination service offline')
+    expect(screen.queryByRole('heading', { name: /find cheapest dates/i })).not.toBeInTheDocument()
+  })
 })
 
 describe('background date sweeps', () => {
@@ -302,6 +466,68 @@ describe('background date sweeps', () => {
     expect(api.getSweep).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps a terminal GET snapshot when a slower DELETE response is still running', async () => {
+    const cancellation = deferred()
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-race', status: 'queued' })
+    api.getSweep
+      .mockResolvedValueOnce({
+        jobId: 'sweep-race', status: 'running', progress: { completed: 1, total: 3 },
+        partial: [], result: null, warnings: [], cancelRequested: false,
+      })
+      .mockResolvedValueOnce({
+        jobId: 'sweep-race', status: 'cancelled', progress: { completed: 1, total: 3 },
+        partial: [], result: null, warnings: [], cancelRequested: true,
+      })
+    api.cancelSweep.mockImplementation(() => cancellation.promise)
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+    await act(async () => vi.advanceTimersByTimeAsync(750))
+
+    expect(screen.getByRole('heading', { name: /date sweep cancelled/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeEnabled()
+
+    await act(async () => {
+      cancellation.resolve({ jobId: 'sweep-race', status: 'running', cancelRequested: true })
+    })
+
+    expect(screen.getByRole('heading', { name: /date sweep cancelled/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeEnabled()
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears a cancellation transport error after polling reaches cancelled', async () => {
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-cancel-error', status: 'queued' })
+    api.getSweep
+      .mockResolvedValueOnce({
+        jobId: 'sweep-cancel-error', status: 'running', progress: { completed: 1, total: 3 },
+        partial: [], result: null, warnings: [], cancelRequested: false,
+      })
+      .mockResolvedValueOnce({
+        jobId: 'sweep-cancel-error', status: 'cancelled', progress: { completed: 1, total: 3 },
+        partial: [], result: null, warnings: [], cancelRequested: true,
+      })
+    api.cancelSweep.mockRejectedValue(new Error('DELETE response was lost'))
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+    await act(async () => {})
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Sweep cancellation failed: DELETE response was lost',
+    )
+
+    await act(async () => vi.advanceTimersByTimeAsync(750))
+    expect(screen.getByRole('heading', { name: /date sweep cancelled/i })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('clears sweep-only output as soon as an ordinary search starts', async () => {
     const user = userEvent.setup()
     const pendingSearch = deferred()
@@ -333,6 +559,49 @@ describe('background date sweeps', () => {
     expect(screen.queryByRole('heading', { name: /date sweep/i })).not.toBeInTheDocument()
   })
 
+  it('shows the requested date range without installing blank query dates when no sweep price exists', async () => {
+    const user = userEvent.setup()
+    const previousQuery = { checkin: '2026-09-10', checkout: '2026-09-15' }
+    api.fetchJson.mockImplementation(path => {
+      if (path === '/api/destinations') return Promise.resolve(DESTINATIONS)
+      if (path === '/api/search-all') {
+        return Promise.resolve(searchResult(
+          previousQuery,
+          hotel('Previous Search Hotel', 'Phuket', 180, 'previous'),
+        ))
+      }
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-empty', status: 'queued' })
+    api.getSweep.mockResolvedValue({
+      jobId: 'sweep-empty',
+      status: 'completed',
+      progress: { completed: 2, total: 2 },
+      partial: [],
+      result: {
+        startDate: '2026-11-01',
+        endDate: '2026-12-01',
+        dates: [],
+        cheapestDate: null,
+        bestDateResults: { beachfront: [], non_beachfront: [] },
+      },
+      warnings: [],
+      cancelRequested: false,
+    })
+    await renderReady()
+
+    setSearchDates(previousQuery.checkin, previousQuery.checkout)
+    await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+    expect(await screen.findByText('Previous Search Hotel')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+
+    expect(await screen.findByText(/No priced hotel results were found from 2026-11-01 to 2026-12-01/)).toBeInTheDocument()
+    expect(screen.queryByText('Previous Search Hotel')).not.toBeInTheDocument()
+    expect(screen.queryByText(/^Stay:/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /hotels and above/i })).not.toBeInTheDocument()
+  })
+
   it('announces a polling failure as a date-sweep error', async () => {
     const user = userEvent.setup()
     api.createSweep.mockResolvedValue({ jobId: 'sweep-error', status: 'queued' })
@@ -355,7 +624,8 @@ describe('background date sweeps', () => {
       progress: { completed: 0, total: 2 },
       partial: [],
       result: null,
-      warnings: [{ message: 'Hotel providers were unavailable' }],
+      warnings: [{ message: 'Generic sweep warning' }],
+      error: { code: 'upstream_unavailable', message: 'Hotel providers were unavailable' },
       cancelRequested: false,
     })
     await renderReady()
@@ -363,7 +633,8 @@ describe('background date sweeps', () => {
     await user.click(screen.getByRole('button', { name: /find cheapest dates/i }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Date sweep failed: Hotel providers were unavailable',
+      'Date sweep failed: Hotel providers were unavailable (upstream_unavailable)',
     )
+    expect(screen.getByRole('alert')).not.toHaveTextContent('Generic sweep warning')
   })
 })

@@ -8,19 +8,30 @@ function formatToday(now) {
   return `${year}-${month}-${day}`
 }
 
+function destinationNames(destinations) {
+  const groups = Array.isArray(destinations)
+    ? destinations
+    : Object.values(destinations || {}).flat()
+  return [...new Set(groups
+    .map(destination => typeof destination === 'string' ? destination : destination?.name)
+    .filter(Boolean))]
+}
+
 export default function SearchPanel({
   now = new Date(),
   value,
+  destinations = {},
   onChange,
   onSubmit,
   loading = false,
 }) {
   const [localValue, setLocalValue] = useState(() => ({
-    ...defaultSearchDates(now), minStars: 5, maxFlight: 300,
+    ...defaultSearchDates(now), minStars: 5, maxFlight: 300, mode: 'all', location: '',
   }))
   const [validationError, setValidationError] = useState('')
   const query = { ...localValue, ...value }
   const nights = nightsBetween(query.checkin, query.checkout)
+  const locations = destinationNames(destinations)
 
   const update = changes => {
     const next = { ...query, ...changes }
@@ -35,7 +46,16 @@ export default function SearchPanel({
       setValidationError('Check-out must be after check-in.')
       return
     }
-    onSubmit?.({ ...query, nights })
+    if (query.mode === 'single' && !locations.includes(query.location)) {
+      setValidationError('Choose an available destination.')
+      return
+    }
+    const { mode, location, ...parameters } = query
+    onSubmit?.({
+      ...parameters,
+      ...(mode === 'single' ? { location } : {}),
+      nights,
+    })
   }
 
   return (
@@ -44,6 +64,30 @@ export default function SearchPanel({
       <form onSubmit={submit} noValidate>
         <fieldset className="fields">
           <legend>Search parameters</legend>
+          <label>
+            Search scope
+            <select
+              value={query.mode}
+              onChange={event => update({ mode: event.target.value, location: '' })}
+            >
+              <option value="all">All destinations</option>
+              <option value="single">One destination</option>
+            </select>
+          </label>
+          {query.mode === 'single' && (
+            <label>
+              Destination
+              <select
+                value={query.location}
+                onChange={event => update({ location: event.target.value })}
+              >
+                <option value="">Choose a destination</option>
+                {locations.map(location => (
+                  <option key={location} value={location}>{location}</option>
+                ))}
+              </select>
+            </label>
+          )}
           <label>
             Check-in
             <input
@@ -88,7 +132,9 @@ export default function SearchPanel({
             />
           </label>
           <button className="search-btn" type="submit" disabled={loading}>
-            {loading ? 'Searching…' : 'Search all destinations'}
+            {loading
+              ? 'Searching…'
+              : query.mode === 'single' ? 'Search one destination' : 'Search all destinations'}
           </button>
         </fieldset>
         {validationError && <p className="inline-error" role="alert">{validationError}</p>}

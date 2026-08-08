@@ -53,4 +53,33 @@ describe('SweepProgress', () => {
     expect(screen.getByText('rate_limited — Bangkok')).toBeInTheDocument()
     expect(screen.getByText('{"details":["unexpected",429]}')).toBeInTheDocument()
   })
+
+  it('disables repeated cancellation after a cancellation request', () => {
+    render(
+      <SweepProgress
+        job={{
+          jobId: 'sweep-cancelling',
+          status: 'running',
+          progress: { completed: 1, total: 3 },
+          cancelRequested: true,
+        }}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: 'Cancellation requested' })).toBeDisabled()
+  })
+
+  it('renders indeterminate progress until the backend provides a total', () => {
+    render(
+      <SweepProgress
+        job={{ jobId: 'sweep-queued', status: 'queued', progress: {} }}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('status')).toHaveTextContent('Waiting for progress details')
+    expect(screen.getByRole('progressbar')).not.toHaveAttribute('value')
+    expect(screen.queryByText('0 of 1 searches complete')).not.toBeInTheDocument()
+  })
 })
