@@ -1,6 +1,10 @@
 import { useState } from 'react'
 import { defaultSweepDates } from '../lib/dates'
 
+const MAX_NIGHTS = 30
+const MAX_SAMPLE_COUNT = 10
+const MAX_LOGICAL_SEARCHES = 200
+
 function flattenDestinations(destinations) {
   if (Array.isArray(destinations)) return destinations
   return Object.values(destinations || {}).flat()
@@ -8,6 +12,10 @@ function flattenDestinations(destinations) {
 
 function destinationName(destination) {
   return typeof destination === 'string' ? destination : destination.name
+}
+
+function normalizedLocation(value) {
+  return String(value || '').trim().toLocaleLowerCase()
 }
 
 export default function DateSweep({
@@ -25,13 +33,34 @@ export default function DateSweep({
   const sweep = { ...localValue, ...value }
   const allDestinations = flattenDestinations(destinations)
   const allLocations = allDestinations.map(destinationName).filter(Boolean)
+  const canonicalSingleLocation = allLocations.find(
+    location => normalizedLocation(location) === normalizedLocation(sweep.location),
+  )
   const selectedLocations = sweep.mode === 'single'
-    ? (sweep.location.trim() ? [sweep.location.trim()] : [])
+    ? (canonicalSingleLocation ? [canonicalSingleLocation] : [])
     : sweep.mode === 'category'
       ? (destinations?.[sweep.category] || []).map(destinationName).filter(Boolean)
       : allLocations
   const validRange = sweep.startDate && sweep.endDate && sweep.endDate > sweep.startDate
-  const canSubmit = !loading && validRange && selectedLocations.length > 0 && sweep.sampleCount >= 1
+  const nights = Number(sweep.nights)
+  const sampleCount = Number(sweep.sampleCount)
+  const validNights = Number.isInteger(nights) && nights >= 1 && nights <= MAX_NIGHTS
+  const validSampleCount = Number.isInteger(sampleCount) && sampleCount >= 1 && sampleCount <= MAX_SAMPLE_COUNT
+  const logicalSearches = selectedLocations.length * sampleCount
+  const constraintError = !validRange
+    ? 'The end date must be after the start date.'
+    : sweep.mode === 'single' && !canonicalSingleLocation
+      ? 'Choose a listed destination before starting a sweep.'
+      : selectedLocations.length === 0
+        ? 'Choose at least one destination before starting a sweep.'
+        : !validNights
+          ? `Nights must be between 1 and ${MAX_NIGHTS}.`
+          : !validSampleCount
+            ? `Samples must be between 1 and ${MAX_SAMPLE_COUNT}.`
+            : logicalSearches > MAX_LOGICAL_SEARCHES
+              ? `Sweep must not exceed ${MAX_LOGICAL_SEARCHES} logical hotel searches.`
+              : ''
+  const canSubmit = !loading && !constraintError
 
   const update = changes => {
     const next = { ...sweep, ...changes }
@@ -42,20 +71,16 @@ export default function DateSweep({
 
   const submit = event => {
     event.preventDefault()
-    if (!validRange) {
-      setValidationError('The end date must be after the start date.')
-      return
-    }
-    if (!selectedLocations.length) {
-      setValidationError('Choose a location before starting a sweep.')
+    if (constraintError) {
+      setValidationError(constraintError)
       return
     }
     onSubmit?.({
       locations: selectedLocations,
       startDate: sweep.startDate,
       endDate: sweep.endDate,
-      nights: Number(sweep.nights),
-      sampleCount: Number(sweep.sampleCount),
+      nights,
+      sampleCount,
     })
   }
 
@@ -117,11 +142,11 @@ export default function DateSweep({
             </label>
             <label>
               Nights
-              <input type="number" value={sweep.nights} min="1" max="30" onChange={event => update({ nights: Number(event.target.value) })} />
+              <input type="number" value={sweep.nights} min="1" max={MAX_NIGHTS} onChange={event => update({ nights: Number(event.target.value) })} />
             </label>
             <label>
               Samples
-              <input type="number" value={sweep.sampleCount} min="1" max="200" onChange={event => update({ sampleCount: Number(event.target.value) })} />
+              <input type="number" value={sweep.sampleCount} min="1" max={MAX_SAMPLE_COUNT} onChange={event => update({ sampleCount: Number(event.target.value) })} />
             </label>
             <button className="search-btn sweep" type="submit" disabled={!canSubmit}>
               {loading ? 'Sweeping…' : 'Find cheapest dates'}
@@ -129,7 +154,9 @@ export default function DateSweep({
           </div>
         </fieldset>
         <p className="sweep-note">Six dates are sampled across the next 90 days by default.</p>
-        {validationError && <p className="inline-error" role="alert">{validationError}</p>}
+        {(validationError || constraintError) && (
+          <p className="inline-error" role="alert">{validationError || constraintError}</p>
+        )}
       </form>
     </section>
   )

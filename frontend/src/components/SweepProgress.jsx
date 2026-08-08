@@ -10,6 +10,24 @@ function partialPrice(item) {
   return item.cheapestPrice ?? item.cheapest_price
 }
 
+function warningText(warning) {
+  if (typeof warning === 'string') return warning
+  if (warning === null || warning === undefined) return 'Unknown sweep warning'
+  if (typeof warning !== 'object') return String(warning)
+  if (typeof warning.message === 'string' && warning.message.trim()) return warning.message.trim()
+
+  const summary = [warning.code, warning.location]
+    .filter(value => typeof value === 'string' && value.trim())
+    .map(value => value.trim())
+  if (summary.length) return summary.join(' — ')
+
+  try {
+    return JSON.stringify(warning) || 'Unknown sweep warning'
+  } catch {
+    return 'Unknown sweep warning'
+  }
+}
+
 export default function SweepProgress({ job, onCancel }) {
   if (!job) return null
 
@@ -19,13 +37,14 @@ export default function SweepProgress({ job, onCancel }) {
   const partial = job.partial || []
   const warnings = job.warnings || []
   const cancellable = job.status === 'queued' || job.status === 'running'
+  const jobId = job.jobId ?? job.id
 
   return (
     <section className="sweep-progress" aria-labelledby="sweep-progress-title">
       <div className="table-header">
         <h2 id="sweep-progress-title">Date sweep {job.status}</h2>
-        {cancellable && (
-          <button className="cancel-btn" type="button" onClick={() => onCancel?.(job.id)}>
+        {cancellable && jobId && (
+          <button className="cancel-btn" type="button" onClick={() => onCancel?.(jobId)}>
             Cancel sweep
           </button>
         )}
@@ -50,7 +69,10 @@ export default function SweepProgress({ job, onCancel }) {
       )}
       {warnings.length > 0 && (
         <ul className="warning-list" aria-label="Sweep warnings">
-          {warnings.map(warning => <li key={warning}>{warning}</li>)}
+          {warnings.map((warning, index) => {
+            const text = warningText(warning)
+            return <li key={`${index}-${text}`}>{text}</li>
+          })}
         </ul>
       )}
     </section>

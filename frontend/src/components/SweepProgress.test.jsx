@@ -6,13 +6,13 @@ import SweepProgress from './SweepProgress'
 afterEach(cleanup)
 
 describe('SweepProgress', () => {
-  it('announces progress, partial results, warnings, and cancellation', async () => {
+  it('announces progress and cancels the canonical jobId', async () => {
     const user = userEvent.setup()
     const onCancel = vi.fn()
     render(
       <SweepProgress
         job={{
-          id: 'sweep-7',
+          jobId: 'sweep-7',
           status: 'running',
           progress: { completed: 2, total: 6, currentLocation: 'Phuket' },
           partial: [{ checkin: '2026-08-09', cheapestPrice: 120, location: 'Bangkok' }],
@@ -31,5 +31,26 @@ describe('SweepProgress', () => {
     await user.click(screen.getByRole('button', { name: 'Cancel sweep' }))
     expect(onCancel).toHaveBeenCalledTimes(1)
     expect(onCancel).toHaveBeenCalledWith('sweep-7')
+  })
+
+  it('renders JSON-safe warning objects as useful text', () => {
+    render(
+      <SweepProgress
+        job={{
+          jobId: 'sweep-8',
+          status: 'running',
+          progress: { completed: 0, total: 2 },
+          warnings: [
+            { message: 'Phuket timed out', code: 'timeout', location: 'Phuket' },
+            { code: 'rate_limited', location: 'Bangkok' },
+            { details: ['unexpected', 429] },
+          ],
+        }}
+      />,
+    )
+
+    expect(screen.getByText('Phuket timed out')).toBeInTheDocument()
+    expect(screen.getByText('rate_limited — Bangkok')).toBeInTheDocument()
+    expect(screen.getByText('{"details":["unexpected",429]}')).toBeInTheDocument()
   })
 })
