@@ -424,8 +424,15 @@ def test_search_rejects_unsafe_google_search_redirect_targets(app_factory, locat
     "target",
     [
         "/travel/search?q=5+star+hotels+Bangkok&curr=USD&hl=en",
+        "/travel/search?q=5+star+hotels+Bangkok&ths=&curr=USD&hl=en",
         "/travel/search?q=5+star+hotels+Bangkok&ths=x&ths=&curr=USD&hl=en",
         "/travel/search?q=5+star+hotels+Bangkok&ths=x&ths=y&curr=USD&hl=en",
+        "/travel/search?ths=x&curr=USD&hl=en",
+        "/travel/search?q=other+hotels&ths=x&curr=USD&hl=en",
+        (
+            "/travel/search?q=5+star+hotels+Bangkok"
+            "&q=5+star+hotels+Bangkok&ths=x&curr=USD&hl=en"
+        ),
         "/travel/search?q=5+star+hotels+Bangkok&ths=x&hl=en",
         "/travel/search?q=5+star+hotels+Bangkok&ths=x&curr=CAD&hl=en",
         "/travel/search?q=5+star+hotels+Bangkok&ths=x&curr=USD&curr=CAD&hl=en",
