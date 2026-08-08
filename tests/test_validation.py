@@ -20,6 +20,25 @@ TODAY = date(2026, 8, 8)
 KNOWN_LOCATIONS = {"Bangkok", "Phuket"}
 
 
+def hotel_payload(**overrides):
+    payload = {
+        "name": "Test Grand Hotel",
+        "location": "Bangkok",
+        "url": "https://www.google.com/travel/hotels/entity/abc",
+        "checkin": "2026-08-09",
+        "checkout": "2026-08-10",
+        "price": 220,
+        "rating": 4.7,
+        "star_class": 5,
+        "confirmation": "html",
+        "amenities": ["Pool", "Spa"],
+        "category": "non_beachfront",
+        "flight_cost": 126,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_search_parses_typed_future_request():
     request = parse_search_request(
         {"location": "Bangkok", "checkin": "2026-08-09", "checkout": "2026-08-14", "minStars": 4},
@@ -66,6 +85,51 @@ def test_search_all_defaults_to_known_locations_and_respects_flight_budget():
         min_stars=5,
         max_flight=300,
     )
+
+
+def test_search_all_accepts_established_destinations_field():
+    request = parse_search_all_request(
+        {
+            "destinations": ["Phuket", "Bangkok"],
+            "checkin": "2026-08-09",
+            "checkout": "2026-08-10",
+        },
+        KNOWN_LOCATIONS,
+        today=TODAY,
+    )
+
+    assert request.locations == ("Phuket", "Bangkok")
+
+
+def test_search_all_rejects_unknown_destination_from_established_field():
+    with pytest.raises(ValidationProblem) as error:
+        parse_search_all_request(
+            {
+                "destinations": ["Atlantis"],
+                "checkin": "2026-08-09",
+                "checkout": "2026-08-10",
+            },
+            KNOWN_LOCATIONS,
+            today=TODAY,
+        )
+
+    assert "destinations[0]" in error.value.fields
+
+
+def test_search_all_rejects_conflicting_destination_aliases():
+    with pytest.raises(ValidationProblem) as error:
+        parse_search_all_request(
+            {
+                "destinations": ["Bangkok"],
+                "locations": ["Phuket"],
+                "checkin": "2026-08-09",
+                "checkout": "2026-08-10",
+            },
+            KNOWN_LOCATIONS,
+            today=TODAY,
+        )
+
+    assert "destinations" in error.value.fields
 
 
 def test_sweep_rejects_past_and_excessive_work():
@@ -141,19 +205,34 @@ def test_provider_url_allowlist_accepts_google_entity_url():
     )
 
 
-def test_compare_parses_bounded_hotel_inputs_and_validates_urls():
+def test_provider_url_allowlist_returns_canonical_bounded_url():
+    assert validate_google_hotel_url(
+        "HTTPS://WWW.GOOGLE.COM:443/travel/hotels/entity/abc?foo=bar#section"
+    ) == "https://www.google.com/travel/hotels/entity/abc?foo=bar"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.google.com/travel/hotels/entity/abc\r\nX-Test: injected",
+        f"https://www.google.com/travel/hotels/entity/abc?query={'x' * 1025}",
+        f"https://www.google.com/travel/hotels/entity/{'x' * 2048}",
+    ],
+)
+def test_provider_url_allowlist_rejects_controls_and_oversize_query(url):
+    with pytest.raises(ValidationProblem):
+        validate_google_hotel_url(url)
+
+
+def test_compare_round_trips_safe_display_metadata():
     request = parse_compare_request(
         {
             "checkin": "2026-08-09",
             "checkout": "2026-08-10",
             "hotels": [
-                {
-                    "name": "Test Grand Hotel",
-                    "location": "Bangkok",
-                    "url": "https://www.google.com/travel/hotels/entity/abc",
-                    "checkin": "2026-08-09",
-                    "checkout": "2026-08-10",
-                }
+                hotel_payload(
+                    url="HTTPS://WWW.GOOGLE.COM:443/travel/hotels/entity/abc#discarded"
+                )
             ],
         },
         KNOWN_LOCATIONS,
@@ -164,3 +243,79 @@ def test_compare_parses_bounded_hotel_inputs_and_validates_urls():
     assert request.hotels[0].name == "Test Grand Hotel"
     assert request.hotels[0].url == "https://www.google.com/travel/hotels/entity/abc"
     assert request.hotels[0].checkin == date(2026, 8, 9)
+    assert request.hotels[0].price == 220.0
+    assert request.hotels[0].rating == 4.7
+    assert request.hotels[0].star_class == 5
+    assert request.hotels[0].confirmation == "html"
+    assert request.hotels[0].amenities == ("Pool", "Spa")
+    assert request.hotels[0].category == "non_beachfront"
+    assert request.hotels[0].flight_cost == 126.0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"price": float("nan")}, "price"),
+        ({"price": True}, "price"),
+        ({"price": 10**400}, "price"),
+        ({"rating": float("nan")}, "rating"),
+        ({"rating": True}, "rating"),
+        ({"star_class": True}, "star_class"),
+        ({"flight_cost": float("nan")}, "flight_cost"),
+        ({"flight_cost": False}, "flight_cost"),
+    ],
+)
+def test_compare_rejects_nan_and_boolean_metadata(overrides, field):
+    with pytest.raises(ValidationProblem) as error:
+        parse_compare_request(
+            {
+                "checkin": "2026-08-09",
+                "checkout": "2026-08-10",
+                "hotels": [hotel_payload(**overrides)],
+            },
+            KNOWN_LOCATIONS,
+            today=TODAY,
+        )
+
+    assert f"hotels[0].{field}" in error.value.fields
+
+
+@pytest.mark.parametrize(
+    ("payload_overrides", "known_locations", "expected_field"),
+    [
+        ({"name": "N" * 201}, KNOWN_LOCATIONS, "hotels[0].name"),
+        ({"name": "Safe\nInjected"}, KNOWN_LOCATIONS, "hotels[0].name"),
+        ({"location": "B" * 101}, {"B" * 101}, "hotels[0].location"),
+        ({"location": "Bangkok\x00"}, {"Bangkok\x00"}, "hotels[0].location"),
+    ],
+)
+def test_compare_rejects_oversize_or_controlled_names_and_locations(
+    payload_overrides, known_locations, expected_field
+):
+    with pytest.raises(ValidationProblem) as error:
+        parse_compare_request(
+            {
+                "checkin": "2026-08-09",
+                "checkout": "2026-08-10",
+                "hotels": [hotel_payload(**payload_overrides)],
+            },
+            known_locations,
+            today=TODAY,
+        )
+
+    assert expected_field in error.value.fields
+
+
+def test_compare_rejects_control_character_in_date():
+    with pytest.raises(ValidationProblem) as error:
+        parse_compare_request(
+            {
+                "checkin": "2026-08-09\n",
+                "checkout": "2026-08-10",
+                "hotels": [hotel_payload()],
+            },
+            KNOWN_LOCATIONS,
+            today=TODAY,
+        )
+
+    assert "checkin" in error.value.fields

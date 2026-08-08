@@ -79,3 +79,26 @@ def test_provider_parser_keeps_lowest_valid_price_for_each_provider():
     html = r"Agoda \x24220 unrelated text Agoda \u0024180 Agoda $7"
 
     assert parse_provider_prices(html) == {"agoda": 180.0}
+
+
+def test_provider_parser_does_not_claim_price_after_next_provider_label():
+    html = r"Agoda unavailable Booking.com \x24230"
+
+    assert parse_provider_prices(html) == {"booking.com": 230.0}
+
+
+def test_hotel_parser_skips_malformed_price_without_aborting_later_cards():
+    html = """
+    <div class="uaTTDe"><h2 class="BgYkof">Broken Price Hotel</h2>
+    <span class="ne5qie Ih19Ad">5-star hotel</span><span>$,,,</span></div>
+    <div class="uaTTDe"><h2 class="BgYkof">Valid Price Hotel</h2>
+    <span class="ne5qie Ih19Ad">5-star hotel</span><span>$240</span></div>
+    """
+
+    hotels = parse_hotel_cards(
+        html,
+        ParseContext("Bangkok", "2026-08-09", "2026-08-10", 5, "non_beachfront", 126),
+    )
+
+    assert [hotel["name"] for hotel in hotels] == ["Valid Price Hotel"]
+    assert hotels[0]["price"] == 240.0

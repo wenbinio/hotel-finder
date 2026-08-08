@@ -186,10 +186,15 @@ def parse_hotel_cards(html: str, context: ParseContext) -> list[dict[str, Any]]:
         star_class = html_star or brand_star_class(name)
         if star_class is None or star_class < context.min_stars:
             continue
-        price_match = re.search(r"\$([0-9,]+)", card.text())
+        price_match = re.search(
+            r"\$((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+))(?![0-9,])", card.text()
+        )
         if price_match is None:
             continue
-        price = float(price_match.group(1).replace(",", ""))
+        try:
+            price = float(price_match.group(1).replace(",", ""))
+        except ValueError:
+            continue
         if price > 1500:
             continue
         hotels.append(
@@ -214,11 +219,16 @@ def parse_hotel_cards(html: str, context: ParseContext) -> list[dict[str, Any]]:
 def parse_provider_prices(html: str) -> dict[str, float]:
     """Extract valid provider prices from a Google Hotels entity page without fetching it."""
     providers: dict[str, float] = {}
+    labels: list[tuple[int, int, str]] = []
     for display_name, provider_key in PROVIDER_NAMES:
         for match in re.finditer(re.escape(display_name), html, re.IGNORECASE):
-            chunk = html[match.end() : match.end() + 300]
-            for value in re.findall(r"(?:\\x24|\\u0024|\$)(\d+)", chunk):
-                price = float(value)
-                if 10 < price < 2000:
-                    providers[provider_key] = min(price, providers.get(provider_key, price))
+            labels.append((match.start(), match.end(), provider_key))
+    labels.sort()
+    for index, (_, label_end, provider_key) in enumerate(labels):
+        next_label_start = labels[index + 1][0] if index + 1 < len(labels) else len(html)
+        chunk = html[label_end : min(label_end + 300, next_label_start)]
+        for value in re.findall(r"(?:\\x24|\\u0024|\$)(\d+)", chunk):
+            price = float(value)
+            if 10 < price < 2000:
+                providers[provider_key] = min(price, providers.get(provider_key, price))
     return providers

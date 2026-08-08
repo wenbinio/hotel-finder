@@ -1,11 +1,13 @@
 """Typed, side-effect-free validation for hotel finder API requests."""
 
+import math
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 MIN_STARS = 3
 MAX_STARS = 5
@@ -15,8 +17,16 @@ MAX_SWEEP_DAYS = 365
 MAX_SAMPLE_COUNT = 10
 MAX_LOGICAL_CALLS = 200
 MAX_COMPARE_HOTELS = 15
+MAX_HOTEL_NAME_LENGTH = 200
+MAX_LOCATION_LENGTH = 100
+MAX_AMENITIES = 32
+MAX_AMENITY_LENGTH = 100
+MAX_URL_LENGTH = 2048
+MAX_URL_QUERY_LENGTH = 1024
 GOOGLE_HOTEL_HOST = "www.google.com"
 GOOGLE_HOTEL_PATH_PREFIX = "/travel/hotels/entity/"
+HOTEL_CATEGORIES = {"beachfront", "non_beachfront"}
+STAR_CONFIRMATIONS = {"html", "brand"}
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 
@@ -79,6 +89,13 @@ class HotelInput:
     url: str | None
     checkin: date
     checkout: date
+    price: float
+    rating: float | None
+    star_class: int
+    confirmation: str
+    amenities: tuple[str, ...]
+    category: str
+    flight_cost: float
 
 
 @dataclass(frozen=True)
@@ -98,15 +115,37 @@ def _object(payload: Any) -> Mapping[str, Any]:
     return payload
 
 
-def _string(payload: Mapping[str, Any], field: str) -> str:
-    value = payload.get(field)
-    if not isinstance(value, str) or not (normalized := value.strip()):
+def _contains_control(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _normalized_string(
+    value: Any, field: str, *, maximum: int | None = None, strip: bool = True
+) -> str:
+    if not isinstance(value, str):
         raise _problem(field, "must be a non-empty string")
+    if _contains_control(value):
+        raise _problem(field, "must not contain control characters")
+    normalized = value.strip() if strip else value
+    if not normalized:
+        raise _problem(field, "must be a non-empty string")
+    if maximum is not None and len(normalized) > maximum:
+        raise _problem(field, f"must contain at most {maximum} characters")
     return normalized
 
 
+def _string(
+    payload: Mapping[str, Any],
+    field: str,
+    *,
+    maximum: int | None = None,
+    strip: bool = True,
+) -> str:
+    return _normalized_string(payload.get(field), field, maximum=maximum, strip=strip)
+
+
 def _date(payload: Mapping[str, Any], field: str) -> date:
-    value = _string(payload, field)
+    value = _string(payload, field, maximum=10, strip=False)
     if _ISO_DATE.fullmatch(value) is None:
         raise _problem(field, "must use YYYY-MM-DD format")
     try:
@@ -128,10 +167,29 @@ def _number(payload: Mapping[str, Any], field: str, default: float, minimum: flo
     value = payload.get(field, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _problem(field, "must be a number")
-    normalized = float(value)
-    if not minimum <= normalized <= maximum:
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as error:
+        raise _problem(field, "must be a finite number") from error
+    if not math.isfinite(normalized) or not minimum <= normalized <= maximum:
         raise _problem(field, f"must be between {minimum:g} and {maximum:g}")
     return normalized
+
+
+def _required_integer(
+    payload: Mapping[str, Any], field: str, minimum: int, maximum: int
+) -> int:
+    if field not in payload:
+        raise _problem(field, "is required")
+    return _integer(payload, field, minimum, minimum, maximum)
+
+
+def _required_number(
+    payload: Mapping[str, Any], field: str, minimum: float, maximum: float
+) -> float:
+    if field not in payload:
+        raise _problem(field, "is required")
+    return _number(payload, field, minimum, minimum, maximum)
 
 
 def _known_location(value: str, field: str, known_locations: set[str]) -> str:
@@ -140,23 +198,45 @@ def _known_location(value: str, field: str, known_locations: set[str]) -> str:
     return value
 
 
-def _locations(payload: Mapping[str, Any], known_locations: set[str]) -> tuple[str, ...]:
-    value = payload.get("locations")
+def _locations_for_field(
+    payload: Mapping[str, Any], known_locations: set[str], field: str
+) -> tuple[str, ...]:
+    value = payload.get(field)
     if value is None:
         return tuple(sorted(known_locations))
     if isinstance(value, str) or not isinstance(value, Sequence):
-        raise _problem("locations", "must be an array of configured destinations")
+        raise _problem(field, "must be an array of configured destinations")
     if not value:
-        raise _problem("locations", "must contain at least one destination")
+        raise _problem(field, "must contain at least one destination")
     locations: list[str] = []
     for index, location in enumerate(value):
-        if not isinstance(location, str) or not (normalized := location.strip()):
-            raise _problem(f"locations[{index}]", "must be a non-empty string")
-        _known_location(normalized, f"locations[{index}]", known_locations)
+        item_field = f"{field}[{index}]"
+        normalized = _normalized_string(location, item_field, maximum=MAX_LOCATION_LENGTH)
+        _known_location(normalized, item_field, known_locations)
         locations.append(normalized)
     if len(set(locations)) != len(locations):
-        raise _problem("locations", "must not contain duplicates")
+        raise _problem(field, "must not contain duplicates")
     return tuple(locations)
+
+
+def _locations(payload: Mapping[str, Any], known_locations: set[str]) -> tuple[str, ...]:
+    return _locations_for_field(payload, known_locations, "locations")
+
+
+def _search_all_locations(
+    payload: Mapping[str, Any], known_locations: set[str]
+) -> tuple[str, ...]:
+    has_locations = "locations" in payload
+    has_destinations = "destinations" in payload
+    if has_locations and has_destinations:
+        locations = _locations_for_field(payload, known_locations, "locations")
+        destinations = _locations_for_field(payload, known_locations, "destinations")
+        if locations != destinations:
+            raise _problem("destinations", "conflicts with locations")
+        return locations
+    if has_destinations:
+        return _locations_for_field(payload, known_locations, "destinations")
+    return _locations(payload, known_locations)
 
 
 def _stay_dates(
@@ -182,7 +262,9 @@ def parse_search_request(
     """Validate one named destination and a bounded future stay."""
     body = _object(payload)
     current_day = today or date.today()
-    location = _known_location(_string(body, "location"), "location", known_locations)
+    location = _known_location(
+        _string(body, "location", maximum=MAX_LOCATION_LENGTH), "location", known_locations
+    )
     checkin, checkout = _stay_dates(body, "checkin", "checkout", current_day)
     min_stars = _integer(body, "minStars", 5, MIN_STARS, MAX_STARS)
     return SearchRequest(location, checkin, checkout, min_stars)
@@ -194,7 +276,7 @@ def parse_search_all_request(
     """Validate an all-destination search while keeping its inputs bounded."""
     body = _object(payload)
     current_day = today or date.today()
-    locations = _locations(body, known_locations)
+    locations = _search_all_locations(body, known_locations)
     checkin, checkout = _stay_dates(body, "checkin", "checkout", current_day)
     min_stars = _integer(body, "minStars", 5, MIN_STARS, MAX_STARS)
     max_flight = _number(body, "maxFlight", 300, 0, MAX_FLIGHT_USD)
@@ -249,6 +331,10 @@ def validate_google_hotel_url(url: Any) -> str:
     """Accept only a direct HTTPS Google Hotels entity URL before any fetch occurs."""
     if not isinstance(url, str) or not url:
         raise _problem("url", "must be a Google Hotels entity URL")
+    if len(url) > MAX_URL_LENGTH:
+        raise _problem("url", f"must contain at most {MAX_URL_LENGTH} characters")
+    if _contains_control(url) or any(character.isspace() for character in url):
+        raise _problem("url", "must not contain whitespace or control characters")
     try:
         parsed = urlsplit(url)
         port = parsed.port
@@ -263,7 +349,26 @@ def validate_google_hotel_url(url: Any) -> str:
         or not parsed.path.startswith(GOOGLE_HOTEL_PATH_PREFIX)
     ):
         raise _problem("url", "must be an HTTPS www.google.com hotel entity URL")
-    return url
+    if len(parsed.query) > MAX_URL_QUERY_LENGTH:
+        raise _problem("url", f"query must contain at most {MAX_URL_QUERY_LENGTH} characters")
+    if _contains_control(unquote(parsed.path)) or _contains_control(unquote(parsed.query)):
+        raise _problem("url", "must not contain encoded control characters")
+    canonical = urlunsplit(("https", GOOGLE_HOTEL_HOST, parsed.path, parsed.query, ""))
+    if len(canonical) > MAX_URL_LENGTH:
+        raise _problem("url", f"must contain at most {MAX_URL_LENGTH} characters")
+    return canonical
+
+
+def _amenities(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    value = payload.get("amenities")
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise _problem("amenities", "must be an array of strings")
+    if len(value) > MAX_AMENITIES:
+        raise _problem("amenities", f"must contain at most {MAX_AMENITIES} items")
+    return tuple(
+        _normalized_string(amenity, f"amenities[{index}]", maximum=MAX_AMENITY_LENGTH)
+        for index, amenity in enumerate(value)
+    )
 
 
 def _hotel_input(
@@ -273,28 +378,50 @@ def _hotel_input(
         raise _problem(f"hotels[{index}]", "must be an object")
     prefix = f"hotels[{index}]"
     try:
-        name = _string(payload, "name")
-    except ValidationProblem as error:
-        raise _problem(f"{prefix}.name", error.fields["name"]) from error
-    try:
-        location = _known_location(_string(payload, "location"), "location", known_locations)
-    except ValidationProblem as error:
-        detail = error.fields.get("location", "must name a configured destination")
-        raise _problem(f"{prefix}.location", detail) from error
-    url = payload.get("url")
-    if url is not None:
-        try:
+        name = _string(payload, "name", maximum=MAX_HOTEL_NAME_LENGTH)
+        location = _known_location(
+            _string(payload, "location", maximum=MAX_LOCATION_LENGTH),
+            "location",
+            known_locations,
+        )
+        url = payload.get("url")
+        if url is not None:
             url = validate_google_hotel_url(url)
-        except ValidationProblem as error:
-            raise _problem(f"{prefix}.url", error.fields["url"]) from error
-    hotel_checkin, hotel_checkout = checkin, checkout
-    if "checkin" in payload or "checkout" in payload:
-        try:
+        hotel_checkin, hotel_checkout = checkin, checkout
+        if "checkin" in payload or "checkout" in payload:
             hotel_checkin, hotel_checkout = _stay_dates(payload, "checkin", "checkout", today)
-        except ValidationProblem as error:
-            field, detail = next(iter(error.fields.items()))
-            raise _problem(f"{prefix}.{field}", detail) from error
-    return HotelInput(name, location, url, hotel_checkin, hotel_checkout)
+        price = _required_number(payload, "price", 0.01, 1500)
+        rating = (
+            None
+            if payload.get("rating") is None
+            else _required_number(payload, "rating", 0, 5)
+        )
+        star_class = _required_integer(payload, "star_class", 1, 5)
+        confirmation = _string(payload, "confirmation", maximum=16, strip=False)
+        if confirmation not in STAR_CONFIRMATIONS:
+            raise _problem("confirmation", "must be html or brand")
+        amenities = _amenities(payload)
+        category = _string(payload, "category", maximum=32, strip=False)
+        if category not in HOTEL_CATEGORIES:
+            raise _problem("category", "must be beachfront or non_beachfront")
+        flight_cost = _required_number(payload, "flight_cost", 0, MAX_FLIGHT_USD)
+    except ValidationProblem as error:
+        field, detail = next(iter(error.fields.items()))
+        raise _problem(f"{prefix}.{field}", detail) from error
+    return HotelInput(
+        name,
+        location,
+        url,
+        hotel_checkin,
+        hotel_checkout,
+        price,
+        rating,
+        star_class,
+        confirmation,
+        amenities,
+        category,
+        flight_cost,
+    )
 
 
 def parse_compare_request(
