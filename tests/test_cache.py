@@ -1,9 +1,10 @@
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Barrier, Event, Lock, Thread
 
 import pytest
 
+import hotel_finder.cache as cache_module
 from hotel_finder.cache import CacheResult, TTLCache
 
 
@@ -87,6 +88,70 @@ def test_persistent_failure_is_shared_once_by_the_waiting_cohort_then_retryable(
     assert cache.get_or_load("same", lambda: "recovered") == CacheResult(
         value="recovered", hit=False
     )
+
+
+def test_failed_flight_is_removed_before_a_woken_waiter_retries(monkeypatch) -> None:
+    failure_published = Event()
+    allow_owner_finish = Event()
+    waiter_joined = Event()
+
+    class PausingFuture(Future):
+        def result(self, timeout=None):
+            waiter_joined.set()
+            return super().result(timeout=timeout)
+
+        def set_exception(self, exception):
+            super().set_exception(exception)
+            failure_published.set()
+            assert allow_owner_finish.wait(2)
+
+    monkeypatch.setattr(cache_module, "Future", PausingFuture)
+    cache = TTLCache(max_entries=8, ttl_seconds=60)
+    owner_started = Event()
+    release_failure = Event()
+    retry_called = Event()
+
+    def failing_loader() -> str:
+        owner_started.set()
+        assert release_failure.wait(2)
+        raise RuntimeError("owner failed")
+
+    def retry_loader() -> str:
+        retry_called.set()
+        return "recovered"
+
+    def wait_then_retry() -> str:
+        try:
+            cache.get_or_load("same", failing_loader)
+        except RuntimeError as exc:
+            assert str(exc) == "owner failed"
+        return cache.get_or_load("same", retry_loader).value
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(cache.get_or_load, "same", failing_loader)
+        assert owner_started.wait(1)
+        waiter = pool.submit(wait_then_retry)
+        assert waiter_joined.wait(1)
+
+        try:
+            release_failure.set()
+            assert failure_published.wait(1)
+            retry_observed_before_owner_finished = retry_called.wait(0.5)
+        finally:
+            allow_owner_finish.set()
+
+        with pytest.raises(RuntimeError, match="owner failed"):
+            owner.result(timeout=2)
+        waiter_error = None
+        try:
+            waiter_result = waiter.result(timeout=2)
+        except RuntimeError as exc:
+            waiter_result = None
+            waiter_error = exc
+
+    assert retry_observed_before_owner_finished
+    assert waiter_error is None
+    assert waiter_result == "recovered"
 
 
 def test_recursive_same_key_load_raises_instead_of_deadlocking() -> None:

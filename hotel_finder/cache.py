@@ -90,6 +90,9 @@ class TTLCache[K: Hashable, V]:
                 value = loader()
                 self.set(key, value, ttl_seconds=ttl)
             except BaseException as exc:
+                with self._lock:
+                    if self._inflight.get(key) is flight:
+                        del self._inflight[key]
                 flight.future.set_exception(exc)
                 raise
             else:
