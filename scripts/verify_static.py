@@ -39,13 +39,17 @@ def normalized_output_path(value: object) -> str:
     return path.as_posix()
 
 
-def declared_manifest_outputs(manifest_text: str) -> set[str]:
+def declared_manifest_outputs(manifest_text: str) -> tuple[set[str], set[str]]:
     manifest = json.loads(manifest_text)
     if not isinstance(manifest, dict) or not manifest:
         raise ValueError("Vite manifest must be a non-empty object")
     for key, record in manifest.items():
         if not isinstance(key, str) or not isinstance(record, dict):
             raise ValueError("Vite manifest entries must be named objects")
+
+    index_entry = manifest.get("index.html")
+    if not isinstance(index_entry, dict) or index_entry.get("isEntry") is not True:
+        raise ValueError("Vite manifest must contain an index.html entry chunk")
 
     roots = sorted(key for key, record in manifest.items() if record.get("isEntry") is True)
     if not roots:
@@ -85,7 +89,15 @@ def declared_manifest_outputs(manifest_text: str) -> set[str]:
     unreachable = sorted(set(manifest) - visited)
     if unreachable:
         raise ValueError("unreachable Vite manifest entries: " + ", ".join(unreachable))
-    return outputs
+
+    index_css = index_entry.get("css", [])
+    if not isinstance(index_css, list):
+        raise ValueError("Vite manifest entry 'index.html' has invalid css")
+    index_outputs = {
+        normalized_output_path(index_entry["file"]),
+        *(normalized_output_path(value) for value in index_css),
+    }
+    return outputs, index_outputs
 
 
 def tracked_static_files(repo_root: Path) -> set[str]:
@@ -123,7 +135,23 @@ def verify_static_tree(
     manifest = static / MANIFEST_PATH
     if not manifest.is_file():
         raise FileNotFoundError(f"Vite manifest is missing: {manifest}")
-    declared_outputs = declared_manifest_outputs(manifest.read_text("utf-8"))
+    declared_outputs, index_outputs = declared_manifest_outputs(manifest.read_text("utf-8"))
+
+    missing_index_references = sorted(index_outputs - references)
+    if missing_index_references:
+        raise ValueError(
+            "index.html must directly reference manifest entry outputs: "
+            + ", ".join(missing_index_references)
+        )
+    html_asset_references = {
+        name for name in references if PurePosixPath(name).parts[0] == "assets"
+    }
+    outside_manifest = sorted(html_asset_references - declared_outputs)
+    if outside_manifest:
+        raise ValueError(
+            "index.html asset references outside reachable manifest graph: "
+            + ", ".join(outside_manifest)
+        )
 
     expected_files = {
         "index.html",

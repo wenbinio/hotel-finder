@@ -201,9 +201,10 @@ def _write_static_tree(
 
 
 GRAPH_MANIFEST = {
-    "src/main.jsx": {
+    "index.html": {
         "file": "assets/entry.js",
         "isEntry": True,
+        "src": "index.html",
         "imports": ["_vendor.js"],
         "dynamicImports": ["src/lazy.jsx"],
         "css": ["assets/entry.css"],
@@ -266,6 +267,39 @@ def test_static_verifier_accepts_complete_split_manifest_graph(tmp_path: Path):
     assert result == verify_static.StaticVerification((), (), ())
 
 
+def test_static_verifier_rejects_stale_html_entry_asset(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path, extra=("assets/old.js",))
+    (static / "index.html").write_text(
+        '<link rel="icon" href="/favicon.svg">'
+        '<script src="/assets/old.js"></script>'
+        '<link rel="stylesheet" href="/assets/entry.css">',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="index.html.*assets/entry.js"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
+def test_static_verifier_requires_entry_css_in_html(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path)
+    (static / "index.html").write_text(
+        '<link rel="icon" href="/favicon.svg">'
+        '<script src="/assets/entry.js"></script>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="index.html.*assets/entry.css"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
+def test_static_verifier_rejects_html_asset_outside_manifest_graph(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path, extra=("assets/old.js",))
+    (static / "index.html").write_text(
+        GRAPH_INDEX + '<script src="/assets/old.js"></script>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="outside.*assets/old.js"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
 @pytest.mark.parametrize(
     "missing",
     ("assets/vendor.js", "assets/font.woff2", "assets/lazy.png"),
@@ -278,7 +312,7 @@ def test_static_verifier_reports_missing_transitive_outputs(tmp_path: Path, miss
 
 def test_static_verifier_rejects_unknown_imported_manifest_entry(tmp_path: Path):
     manifest = json.loads(json.dumps(GRAPH_MANIFEST))
-    manifest["src/main.jsx"]["imports"] = ["_missing.js"]
+    manifest["index.html"]["imports"] = ["_missing.js"]
     static, tracked = _graph_fixture(tmp_path, manifest=manifest)
     with pytest.raises(ValueError, match="unknown manifest entry"):
         verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
