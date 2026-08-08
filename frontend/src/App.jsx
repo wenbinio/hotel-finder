@@ -33,7 +33,7 @@ function warningText(warning) {
   }
 }
 
-function warningRecord(warning) {
+function warningRecord(warning, field) {
   if (typeof warning === 'string') {
     const text = warning.trim()
     return text ? { identity: JSON.stringify(['message', text.toLocaleLowerCase()]), text } : null
@@ -41,28 +41,32 @@ function warningRecord(warning) {
 
   const code = typeof warning?.code === 'string' ? warning.code.trim() : ''
   const location = typeof warning?.location === 'string' ? warning.location.trim() : ''
+  const name = typeof warning?.name === 'string' ? warning.name.trim() : ''
+  const source = typeof warning?.source === 'string' ? warning.source.trim() : ''
   const message = typeof warning?.message === 'string' ? warning.message.trim() : ''
-  const text = message || [location, code].filter(Boolean).join(': ') || warningText(warning)
+  const entity = field === 'failedHotels' ? (name || location) : (location || name)
+  const qualifier = [entity, source, code].filter(Boolean).join(' — ')
+  const text = message || qualifier || warningText(warning)
   if (!text) return null
 
-  const semanticParts = [code.toLocaleLowerCase(), location.toLocaleLowerCase()]
-  const identity = code || location
+  const semanticParts = [code, entity, source].map(value => value.toLocaleLowerCase())
+  const identity = code || entity || source
     ? JSON.stringify(['structured', ...semanticParts])
     : JSON.stringify(['message', text.toLocaleLowerCase()])
-  return { identity, text, qualifier: [location, code].filter(Boolean).join(' — ') }
+  return { identity, text, qualifier }
 }
 
 function responseWarningRecords(response) {
-  const values = ['warnings', 'failedDestinations', 'failedHotels']
-    .flatMap(field => {
-      const value = response?.[field]
-      if (value === null || value === undefined) return []
-      return Array.isArray(value) ? value : [value]
-    })
   const unique = new Map()
-  for (const value of values) {
-    const record = warningRecord(value)
-    if (record && !unique.has(record.identity)) unique.set(record.identity, record)
+  for (const field of ['warnings', 'failedDestinations', 'failedHotels']) {
+    const value = response?.[field]
+    const values = value === null || value === undefined
+      ? []
+      : Array.isArray(value) ? value : [value]
+    for (const warning of values) {
+      const record = warningRecord(warning, field)
+      if (record && !unique.has(record.identity)) unique.set(record.identity, record)
+    }
   }
 
   return [...unique.values()]
@@ -173,6 +177,7 @@ export default function App() {
   const [result, setResult] = useState(null)
   const [searching, setSearching] = useState(false)
   const [comparing, setComparing] = useState(false)
+  const [destinationError, setDestinationError] = useState(null)
   const [error, setError] = useState(null)
   const [searchWarnings, setSearchWarnings] = useState([])
   const [comparisonWarnings, setComparisonWarnings] = useState([])
@@ -188,6 +193,7 @@ export default function App() {
   const pollTimer = useRef(null)
   const sweepInput = useRef(null)
   const pollSweepRef = useRef(null)
+  const cancellationInFlight = useRef(null)
 
   const clearPollTimer = useCallback(() => {
     if (pollTimer.current !== null) {
@@ -211,7 +217,7 @@ export default function App() {
       } catch (loadError) {
         if (request.isCurrent() && !isAbort(loadError)) {
           setDestinationsStatus('failed')
-          setError({ operation: 'Destination loading', message: messageFor(loadError) })
+          setDestinationError({ operation: 'Destination loading', message: messageFor(loadError) })
         }
       } finally {
         request.finish()
@@ -247,14 +253,29 @@ export default function App() {
     setSortKey('price')
   }, [])
 
+  const finishTerminalSweep = useCallback(snapshot => {
+    clearPollTimer()
+    cancellationInFlight.current = null
+    abortCurrent(beginSweep)
+    abortCurrent(beginCancellation)
+    setSweepJob(previous => applySweepSnapshot(previous, snapshot))
+    setError(previous => previous?.operation === 'Sweep cancellation' ? null : previous)
+    if (snapshot.status === 'completed') applySweepResult(snapshot.result)
+    if (snapshot.status === 'failed') {
+      setError({
+        operation: 'Date sweep',
+        message: sweepFailureMessage(snapshot),
+      })
+    }
+  }, [applySweepResult, beginCancellation, beginSweep, clearPollTimer])
+
   const pollSweep = useCallback(async (jobId, request) => {
     try {
       const snapshot = await getSweep(jobId, request.signal)
       if (!request.isCurrent()) return
 
-      setSweepJob(previous => applySweepSnapshot(previous, snapshot))
-
       if (ACTIVE_SWEEP_STATUSES.has(snapshot.status)) {
+        setSweepJob(previous => applySweepSnapshot(previous, snapshot))
         pollTimer.current = setTimeout(() => {
           pollTimer.current = null
           pollSweepRef.current?.(jobId, request)
@@ -262,22 +283,17 @@ export default function App() {
         return
       }
 
-      setError(previous => previous?.operation === 'Sweep cancellation' ? null : previous)
-      if (snapshot.status === 'completed') applySweepResult(snapshot.result)
-      if (snapshot.status === 'failed') {
-        setError({
-          operation: 'Date sweep',
-          message: sweepFailureMessage(snapshot),
-        })
-      }
-      request.finish()
+      if (TERMINAL_SWEEP_STATUSES.has(snapshot.status)) finishTerminalSweep(snapshot)
+      else request.finish()
     } catch (pollError) {
       if (!request.isCurrent() || isAbort(pollError)) return
+      cancellationInFlight.current = null
+      abortCurrent(beginCancellation)
       setSweepJob(previous => previous ? { ...previous, status: 'failed' } : null)
       setError({ operation: 'Date sweep', message: messageFor(pollError) })
       request.finish()
     }
-  }, [applySweepResult])
+  }, [beginCancellation, finishTerminalSweep])
 
   useEffect(() => {
     pollSweepRef.current = pollSweep
@@ -287,6 +303,7 @@ export default function App() {
     clearPollTimer()
     abortCurrent(beginSweep)
     abortCurrent(beginCancellation)
+    cancellationInFlight.current = null
     setSweepJob(null)
   }, [beginCancellation, beginSweep, clearPollTimer])
 
@@ -364,6 +381,7 @@ export default function App() {
     abortCurrent(beginSearch)
     abortCurrent(beginComparison)
     abortCurrent(beginCancellation)
+    cancellationInFlight.current = null
     setSearching(false)
     setComparing(false)
 
@@ -392,26 +410,53 @@ export default function App() {
   }, [beginCancellation, beginComparison, beginSearch, beginSweep, clearPollTimer, pollSweep])
 
   const handleCancel = useCallback(async jobId => {
-    if (!jobId || !ACTIVE_SWEEP_STATUSES.has(sweepJob?.status) || sweepJob.cancelRequested) return
+    if (
+      !jobId
+      || cancellationInFlight.current === jobId
+      || !ACTIVE_SWEEP_STATUSES.has(sweepJob?.status)
+      || sweepJob.cancelRequested
+    ) return
+    cancellationInFlight.current = jobId
     const request = beginCancellation()
     setError(null)
+    setSweepJob(previous => {
+      if (!previous || previous.jobId !== jobId || !ACTIVE_SWEEP_STATUSES.has(previous.status)) {
+        return previous
+      }
+      return { ...previous, cancelRequested: true }
+    })
 
     try {
       const cancellation = await cancelSweep(jobId, request.signal)
       if (!request.isCurrent()) return
+      if (TERMINAL_SWEEP_STATUSES.has(cancellation.status)) {
+        finishTerminalSweep(cancellation)
+        return
+      }
       setSweepJob(previous => {
         if (!previous || previous.jobId !== jobId) return previous
         if (TERMINAL_SWEEP_STATUSES.has(previous.status)) return previous
-        return { ...previous, cancelRequested: cancellation.cancelRequested ?? true }
+        return {
+          ...previous,
+          cancelRequested: cancellation.cancelRequested ?? previous.cancelRequested,
+        }
       })
     } catch (cancelError) {
       if (request.isCurrent() && !isAbort(cancelError)) {
+        cancellationInFlight.current = null
+        setSweepJob(previous => {
+          if (!previous || previous.jobId !== jobId || !ACTIVE_SWEEP_STATUSES.has(previous.status)) {
+            return previous
+          }
+          return { ...previous, cancelRequested: false }
+        })
         setError({ operation: 'Sweep cancellation', message: messageFor(cancelError) })
       }
     } finally {
+      if (request.isCurrent()) cancellationInFlight.current = null
       request.finish()
     }
-  }, [beginCancellation, sweepJob])
+  }, [beginCancellation, finishTerminalSweep, sweepJob])
 
   const sweepActive = ACTIVE_SWEEP_STATUSES.has(sweepJob?.status)
   const groups = groupedHotels(result)
@@ -431,7 +476,11 @@ export default function App() {
       </header>
 
       <fieldset className="operation-group" disabled={sweepActive} aria-label="Hotel search controls">
-        <SearchPanel destinations={destinations || {}} onSubmit={handleSearch} />
+        <SearchPanel
+          destinations={destinations || {}}
+          singleDestinationAvailable={destinationsStatus === 'ready'}
+          onSubmit={handleSearch}
+        />
       </fieldset>
       {destinationsStatus === 'loading' && (
         <p className="operation-status" role="status">Loading destinations…</p>
@@ -442,6 +491,12 @@ export default function App() {
 
       {searching && <p className="operation-status" role="status">Searching for hotels…</p>}
       {comparing && <p className="operation-status" role="status">Comparing provider prices…</p>}
+      {destinationError && (
+        <div className="error" role="alert">
+          <strong>{destinationError.operation} failed:</strong> {destinationError.message}{' '}
+          Single-destination search and date sweeps are unavailable until destinations load.
+        </div>
+      )}
       {error && (
         <div className="error" role="alert">
           <strong>{error.operation} failed:</strong> {error.message}

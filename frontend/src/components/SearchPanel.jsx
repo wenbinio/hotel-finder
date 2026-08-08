@@ -21,6 +21,7 @@ export default function SearchPanel({
   now = new Date(),
   value,
   destinations = {},
+  singleDestinationAvailable = true,
   onChange,
   onSubmit,
   loading = false,
@@ -71,7 +72,7 @@ export default function SearchPanel({
               onChange={event => update({ mode: event.target.value, location: '' })}
             >
               <option value="all">All destinations</option>
-              <option value="single">One destination</option>
+              <option value="single" disabled={!singleDestinationAvailable}>One destination</option>
             </select>
           </label>
           {query.mode === 'single' && (
