@@ -211,6 +211,30 @@ describe('latest search and comparison ownership', () => {
     }
   })
 
+  it('deduplicates a sourced destination warning mirrored without source', async () => {
+    const user = userEvent.setup()
+    api.fetchJson.mockImplementation((path, options) => {
+      if (path === '/api/destinations') return Promise.resolve(DESTINATIONS)
+      if (path === '/api/search-all') {
+        return Promise.resolve({
+          ...searchResult(options.body, hotel('Warning Hotel', 'Bangkok', 180, 'warning-source')),
+          warnings: [{
+            code: 'timeout', location: 'Phuket', source: 'google', message: 'Phuket timed out',
+          }],
+          failedDestinations: [{ code: 'timeout', location: 'Phuket' }],
+        })
+      }
+      return Promise.reject(new Error(`Unexpected API path: ${path}`))
+    })
+    await renderReady()
+
+    await user.click(screen.getByRole('button', { name: /search all destinations/i }))
+
+    const warningList = await screen.findByRole('list', { name: 'Search warnings' })
+    expect(within(warningList).getAllByRole('listitem')).toHaveLength(1)
+    expect(warningList).toHaveTextContent('Phuket timed out')
+  })
+
   it('preserves distinct failed hotels while deduplicating a mirrored warning by entity and source', async () => {
     const user = userEvent.setup()
     const mirrored = {
@@ -227,6 +251,9 @@ describe('latest search and comparison ownership', () => {
             {
               name: 'Beta Hotel', code: 'timeout', source: 'Google Hotels', message: 'Provider timed out',
             },
+            {
+              name: 'Alpha Hotel', code: 'timeout', source: 'Agoda', message: 'Provider timed out',
+            },
           ],
         })
       }
@@ -237,9 +264,11 @@ describe('latest search and comparison ownership', () => {
     await user.click(screen.getByRole('button', { name: /search all destinations/i }))
 
     const warningList = await screen.findByRole('list', { name: 'Search warnings' })
-    expect(within(warningList).getAllByRole('listitem')).toHaveLength(2)
+    expect(within(warningList).getAllByRole('listitem')).toHaveLength(3)
     expect(warningList).toHaveTextContent('Alpha Hotel')
     expect(warningList).toHaveTextContent('Beta Hotel')
+    expect(warningList).toHaveTextContent('Google Hotels')
+    expect(warningList).toHaveTextContent('Agoda')
   })
 
   it('routes accessible single-destination and all-destination searches with their submitted payloads', async () => {
@@ -610,6 +639,105 @@ describe('background date sweeps', () => {
       'Date sweep failed: Cancellation could not be finalized (cancel_failure)',
     )
     expect(pollSignal.aborted).toBe(true)
+  })
+
+  it('lets a terminal DELETE settle after its in-flight poll fails', async () => {
+    const poll = deferred()
+    const cancellation = deferred()
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-poll-error-terminal', status: 'queued' })
+    api.getSweep.mockImplementation(() => poll.promise)
+    api.cancelSweep.mockImplementation(() => cancellation.promise)
+    await renderReady()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+
+    await act(async () => poll.reject(new Error('poll connection lost')))
+    expect(screen.queryByRole('heading', { name: /date sweep failed/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeDisabled()
+
+    await act(async () => cancellation.resolve({
+      jobId: 'sweep-poll-error-terminal',
+      status: 'cancelled',
+      progress: { completed: 0, total: 3 },
+      partial: [],
+      result: null,
+      warnings: [],
+      cancelRequested: true,
+    }))
+
+    expect(screen.getByRole('heading', { name: /date sweep cancelled/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeEnabled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('resumes polling when DELETE remains nonterminal after a poll failure', async () => {
+    const firstPoll = deferred()
+    const cancellation = deferred()
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-poll-error-running', status: 'queued' })
+    api.getSweep
+      .mockImplementationOnce(() => firstPoll.promise)
+      .mockResolvedValueOnce({
+        jobId: 'sweep-poll-error-running',
+        status: 'cancelled',
+        progress: { completed: 0, total: 3 },
+        partial: [],
+        result: null,
+        warnings: [],
+        cancelRequested: true,
+      })
+    api.cancelSweep.mockImplementation(() => cancellation.promise)
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+    await act(async () => firstPoll.reject(new Error('poll connection lost')))
+
+    await act(async () => cancellation.resolve({
+      jobId: 'sweep-poll-error-running', status: 'running', cancelRequested: true,
+    }))
+    expect(screen.queryByRole('heading', { name: /date sweep failed/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeDisabled()
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+
+    act(() => vi.advanceTimersByTime(749))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+
+    expect(api.getSweep).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('heading', { name: /date sweep cancelled/i })).toBeInTheDocument()
+  })
+
+  it('preserves cancelRequested observed from GET when DELETE later fails', async () => {
+    const poll = deferred()
+    const cancellation = deferred()
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-confirmed-cancel', status: 'queued' })
+    api.getSweep.mockImplementation(() => poll.promise)
+    api.cancelSweep.mockImplementation(() => cancellation.promise)
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+    await act(async () => poll.resolve({
+      jobId: 'sweep-confirmed-cancel',
+      status: 'running',
+      progress: { completed: 0, total: 3 },
+      partial: [],
+      result: null,
+      warnings: [],
+      cancelRequested: true,
+    }))
+    await act(async () => cancellation.reject(new Error('DELETE response lost')))
+
+    expect(screen.getByRole('button', { name: /cancellation requested/i })).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Sweep cancellation failed: DELETE response lost',
+    )
   })
 
   it('disables cancel immediately, sends one DELETE, and unlocks after a real failure', async () => {

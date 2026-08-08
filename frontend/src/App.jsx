@@ -33,7 +33,7 @@ function warningText(warning) {
   }
 }
 
-function warningRecord(warning, field) {
+function warningRecord(warning) {
   if (typeof warning === 'string') {
     const text = warning.trim()
     return text ? { identity: JSON.stringify(['message', text.toLocaleLowerCase()]), text } : null
@@ -44,14 +44,18 @@ function warningRecord(warning, field) {
   const name = typeof warning?.name === 'string' ? warning.name.trim() : ''
   const source = typeof warning?.source === 'string' ? warning.source.trim() : ''
   const message = typeof warning?.message === 'string' ? warning.message.trim() : ''
-  const entity = field === 'failedHotels' ? (name || location) : (location || name)
+  const entity = location || name
   const qualifier = [entity, source, code].filter(Boolean).join(' — ')
   const text = message || qualifier || warningText(warning)
   if (!text) return null
 
-  const semanticParts = [code, entity, source].map(value => value.toLocaleLowerCase())
-  const identity = code || entity || source
-    ? JSON.stringify(['structured', ...semanticParts])
+  const normalized = value => value.toLocaleLowerCase()
+  const identity = location
+    ? JSON.stringify(['destination', normalized(code), normalized(location)])
+    : name
+      ? JSON.stringify(['hotel', normalized(code), normalized(name), normalized(source)])
+      : code || source
+        ? JSON.stringify(['structured', normalized(code), normalized(source)])
     : JSON.stringify(['message', text.toLocaleLowerCase()])
   return { identity, text, qualifier }
 }
@@ -64,7 +68,7 @@ function responseWarningRecords(response) {
       ? []
       : Array.isArray(value) ? value : [value]
     for (const warning of values) {
-      const record = warningRecord(warning, field)
+      const record = warningRecord(warning)
       if (record && !unique.has(record.identity)) unique.set(record.identity, record)
     }
   }
@@ -194,6 +198,8 @@ export default function App() {
   const sweepInput = useRef(null)
   const pollSweepRef = useRef(null)
   const cancellationInFlight = useRef(null)
+  const cancellationObserved = useRef(null)
+  const pollRetryAfterCancellation = useRef(null)
 
   const clearPollTimer = useCallback(() => {
     if (pollTimer.current !== null) {
@@ -253,13 +259,34 @@ export default function App() {
     setSortKey('price')
   }, [])
 
+  const scheduleSweepPoll = useCallback((jobId, request) => {
+    clearPollTimer()
+    pollTimer.current = setTimeout(() => {
+      pollTimer.current = null
+      pollSweepRef.current?.(jobId, request)
+    }, POLL_DELAY_MS)
+  }, [clearPollTimer])
+
+  const resumePollAfterCancellation = useCallback(jobId => {
+    const pending = pollRetryAfterCancellation.current
+    if (!pending || pending.jobId !== jobId) return
+    pollRetryAfterCancellation.current = null
+    if (pending.request.isCurrent()) scheduleSweepPoll(jobId, pending.request)
+  }, [scheduleSweepPoll])
+
   const finishTerminalSweep = useCallback(snapshot => {
     clearPollTimer()
     cancellationInFlight.current = null
+    cancellationObserved.current = null
+    pollRetryAfterCancellation.current = null
     abortCurrent(beginSweep)
     abortCurrent(beginCancellation)
     setSweepJob(previous => applySweepSnapshot(previous, snapshot))
-    setError(previous => previous?.operation === 'Sweep cancellation' ? null : previous)
+    setError(previous => (
+      previous?.operation === 'Sweep cancellation' || previous?.operation === 'Date sweep polling'
+        ? null
+        : previous
+    ))
     if (snapshot.status === 'completed') applySweepResult(snapshot.result)
     if (snapshot.status === 'failed') {
       setError({
@@ -275,11 +302,10 @@ export default function App() {
       if (!request.isCurrent()) return
 
       if (ACTIVE_SWEEP_STATUSES.has(snapshot.status)) {
+        if (snapshot.cancelRequested) cancellationObserved.current = jobId
+        setError(previous => previous?.operation === 'Date sweep polling' ? null : previous)
         setSweepJob(previous => applySweepSnapshot(previous, snapshot))
-        pollTimer.current = setTimeout(() => {
-          pollTimer.current = null
-          pollSweepRef.current?.(jobId, request)
-        }, POLL_DELAY_MS)
+        scheduleSweepPoll(jobId, request)
         return
       }
 
@@ -287,13 +313,21 @@ export default function App() {
       else request.finish()
     } catch (pollError) {
       if (!request.isCurrent() || isAbort(pollError)) return
-      cancellationInFlight.current = null
-      abortCurrent(beginCancellation)
+      if (cancellationInFlight.current === jobId) {
+        pollRetryAfterCancellation.current = { jobId, request }
+        setError({ operation: 'Date sweep polling', message: messageFor(pollError) })
+        return
+      }
+      if (cancellationObserved.current === jobId) {
+        setError({ operation: 'Date sweep polling', message: messageFor(pollError) })
+        scheduleSweepPoll(jobId, request)
+        return
+      }
       setSweepJob(previous => previous ? { ...previous, status: 'failed' } : null)
       setError({ operation: 'Date sweep', message: messageFor(pollError) })
       request.finish()
     }
-  }, [beginCancellation, finishTerminalSweep])
+  }, [finishTerminalSweep, scheduleSweepPoll])
 
   useEffect(() => {
     pollSweepRef.current = pollSweep
@@ -304,6 +338,8 @@ export default function App() {
     abortCurrent(beginSweep)
     abortCurrent(beginCancellation)
     cancellationInFlight.current = null
+    cancellationObserved.current = null
+    pollRetryAfterCancellation.current = null
     setSweepJob(null)
   }, [beginCancellation, beginSweep, clearPollTimer])
 
@@ -382,6 +418,8 @@ export default function App() {
     abortCurrent(beginComparison)
     abortCurrent(beginCancellation)
     cancellationInFlight.current = null
+    cancellationObserved.current = null
+    pollRetryAfterCancellation.current = null
     setSearching(false)
     setComparing(false)
 
@@ -433,30 +471,36 @@ export default function App() {
         finishTerminalSweep(cancellation)
         return
       }
+      if (cancellation.cancelRequested) cancellationObserved.current = jobId
+      const preserveCancelRequested = cancellationObserved.current === jobId
       setSweepJob(previous => {
         if (!previous || previous.jobId !== jobId) return previous
         if (TERMINAL_SWEEP_STATUSES.has(previous.status)) return previous
         return {
           ...previous,
-          cancelRequested: cancellation.cancelRequested ?? previous.cancelRequested,
+          cancelRequested: preserveCancelRequested
+            || (cancellation.cancelRequested ?? previous.cancelRequested),
         }
       })
+      resumePollAfterCancellation(jobId)
     } catch (cancelError) {
       if (request.isCurrent() && !isAbort(cancelError)) {
         cancellationInFlight.current = null
+        const preserveCancelRequested = cancellationObserved.current === jobId
         setSweepJob(previous => {
           if (!previous || previous.jobId !== jobId || !ACTIVE_SWEEP_STATUSES.has(previous.status)) {
             return previous
           }
-          return { ...previous, cancelRequested: false }
+          return { ...previous, cancelRequested: preserveCancelRequested }
         })
         setError({ operation: 'Sweep cancellation', message: messageFor(cancelError) })
+        resumePollAfterCancellation(jobId)
       }
     } finally {
       if (request.isCurrent()) cancellationInFlight.current = null
       request.finish()
     }
-  }, [beginCancellation, finishTerminalSweep, sweepJob])
+  }, [beginCancellation, finishTerminalSweep, resumePollAfterCancellation, sweepJob])
 
   const sweepActive = ACTIVE_SWEEP_STATUSES.has(sweepJob?.status)
   const groups = groupedHotels(result)
