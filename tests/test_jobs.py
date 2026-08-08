@@ -193,6 +193,153 @@ def test_cancelling_queued_replacement_prevents_its_runner() -> None:
     assert calls == [1]
 
 
+def test_repeated_replace_terminalizes_superseded_pending_jobs_and_stays_bounded() -> None:
+    entered = Event()
+    release = Event()
+    executed: list[int] = []
+    manager = SweepJobManager(max_retained=8)
+
+    def runner(job, payload):
+        executed.append(payload["index"])
+        if payload["index"] == 0:
+            entered.set()
+            assert release.wait(2)
+        if job.cancel_requested:
+            return None
+        return payload
+
+    first = manager.start({"index": 0}, runner)
+    assert entered.wait(1)
+    replacements = []
+
+    try:
+        for index in range(1, 21):
+            replacements.append(manager.start({"index": index}, runner, replace=True))
+            assert len(manager._jobs) <= 8
+            assert len(manager._futures) <= 8
+
+        assert all(job.status == "cancelled" for job in replacements[:-1])
+        assert replacements[-1].status == "queued"
+        release.set()
+        assert manager.wait(first.id, timeout=2).status == "cancelled"
+        assert manager.wait(replacements[-1].id, timeout=2).status == "completed"
+        assert executed == [0, 20]
+    finally:
+        release.set()
+        manager.shutdown(wait=True)
+
+
+def test_cancelled_pending_replacement_does_not_hide_executing_job_conflict() -> None:
+    entered = Event()
+    release = Event()
+    manager = SweepJobManager()
+
+    def runner(job, payload):
+        if payload["query"] == "original":
+            entered.set()
+            assert release.wait(2)
+        if job.cancel_requested:
+            return None
+        return payload
+
+    original = manager.start({"query": "original"}, runner)
+    assert entered.wait(1)
+    newest = manager.start({"query": "replacement"}, runner, replace=True)
+    assert manager.cancel(newest.id).status == "cancelled"
+
+    conflict = None
+    unexpectedly_admitted = None
+    try:
+        try:
+            unexpectedly_admitted = manager.start({"query": "too early"}, runner)
+        except JobConflict as exc:
+            conflict = exc
+    finally:
+        release.set()
+        assert manager.wait(original.id, timeout=2).status == "cancelled"
+        if unexpectedly_admitted is not None:
+            manager.wait(unexpectedly_admitted.id, timeout=2)
+
+    assert conflict is not None
+    after = manager.start({"query": "after"}, runner)
+    assert manager.wait(after.id, timeout=2).status == "completed"
+    manager.shutdown(wait=True)
+
+
+def test_shutdown_cancels_pending_job_and_rejects_new_work() -> None:
+    entered = Event()
+    release = Event()
+    manager = SweepJobManager()
+
+    def runner(job, payload):
+        if payload["query"] == "original":
+            entered.set()
+            assert release.wait(2)
+        if job.cancel_requested:
+            return None
+        return payload
+
+    original = manager.start({"query": "original"}, runner)
+    assert entered.wait(1)
+    pending = manager.start({"query": "pending"}, runner, replace=True)
+
+    try:
+        manager.shutdown(wait=False, cancel_futures=True)
+        assert original.cancel_requested
+        assert manager.get(pending.id).status == "cancelled"
+        with pytest.raises(RuntimeError, match="shut down"):
+            manager.start({"query": "late"}, runner)
+    finally:
+        release.set()
+        manager.shutdown(wait=True)
+
+
+def test_active_snapshot_prefers_executing_job_over_pending_successor() -> None:
+    original_entered = Event()
+    release_original = Event()
+    replacement_entered = Event()
+    release_replacement = Event()
+    manager = SweepJobManager()
+
+    def runner(job, payload):
+        if payload["query"] == "original":
+            original_entered.set()
+            assert release_original.wait(2)
+        else:
+            replacement_entered.set()
+            assert release_replacement.wait(2)
+        if job.cancel_requested:
+            return None
+        return payload
+
+    original = manager.start({"query": "original"}, runner)
+    assert original_entered.wait(1)
+    replacement = manager.start({"query": "replacement"}, runner, replace=True)
+
+    try:
+        active = manager.active_snapshot()
+        assert active is not None
+        assert active.id == original.id
+        assert active.status == "running"
+        assert active.cancel_requested
+
+        release_original.set()
+        assert manager.wait(original.id, timeout=2).status == "cancelled"
+        assert replacement_entered.wait(1)
+        active = manager.active_snapshot()
+        assert active is not None
+        assert active.id == replacement.id
+        assert active.status == "running"
+
+        release_replacement.set()
+        assert manager.wait(replacement.id, timeout=2).status == "completed"
+        assert manager.active_snapshot() is None
+    finally:
+        release_original.set()
+        release_replacement.set()
+        manager.shutdown(wait=True)
+
+
 def test_cleanup_enforces_count_and_retention_bounds() -> None:
     clock = FakeClock()
     manager = SweepJobManager(max_retained=2, retention_seconds=10, clock=clock)

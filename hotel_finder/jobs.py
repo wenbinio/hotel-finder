@@ -221,7 +221,9 @@ class SweepJobManager:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hotel-sweep")
         self._jobs: dict[str, SweepJob] = {}
         self._futures: dict[str, Future[None]] = {}
-        self._active_id: str | None = None
+        self._executing_id: str | None = None
+        self._pending_id: str | None = None
+        self._shutdown = False
         self._lock = RLock()
 
     def start[P](
@@ -232,23 +234,54 @@ class SweepJobManager:
         replace: bool = False,
     ) -> SweepJob:
         with self._lock:
+            if self._shutdown:
+                raise RuntimeError("sweep job manager is shut down")
+
+            self._cleanup_locked()
+            executing = self._executing_job_locked()
+            pending = self._pending_job_locked()
+            if not replace:
+                if executing is not None:
+                    raise JobConflict(executing.id)
+                if pending is not None:
+                    raise JobConflict(pending.id)
+            elif pending is not None:
+                self._cancel_pending_locked()
+
+            executing = self._executing_job_locked()
             self._cleanup_locked(reserve=1)
-            active = self._active_job_locked()
-            if active is not None:
-                if not replace:
-                    raise JobConflict(active.id)
-                active._request_cancel()
+            if len(self._jobs) >= self._max_retained:
+                if executing is not None:
+                    raise JobConflict(executing.id)
+                raise RuntimeError("sweep job registry is at capacity")
+            if replace and executing is not None:
+                executing._request_cancel()
 
             job_id = uuid.uuid4().hex
             while job_id in self._jobs:
                 job_id = uuid.uuid4().hex
             job = SweepJob(id=job_id, created_at=self._clock())
             self._jobs[job_id] = job
-            self._active_id = job_id
-            self._futures[job_id] = self._executor.submit(
-                self._run_job, job, payload, runner
-            )
+            self._pending_id = job_id
+            try:
+                self._futures[job_id] = self._executor.submit(
+                    self._run_job, job, payload, runner
+                )
+            except BaseException:
+                self._pending_id = None
+                self._drop_job_locked(job_id)
+                raise
             return job
+
+    def active_snapshot(self) -> SweepJobSnapshot | None:
+        """Return the executing job, or the pending successor when no job is executing."""
+        with self._lock:
+            self._cleanup_locked()
+            executing = self._executing_job_locked()
+            if executing is not None:
+                return executing.snapshot()
+            pending = self._pending_job_locked()
+            return pending.snapshot() if pending is not None else None
 
     def get(self, job_id: str) -> SweepJobSnapshot:
         with self._lock:
@@ -264,11 +297,8 @@ class SweepJobManager:
                 return snapshot
 
             job._request_cancel()
-            future = self._futures[job_id]
-            if future.cancel():
-                job._mark_cancelled(self._clock())
-                if self._active_id == job_id:
-                    self._active_id = None
+            if self._pending_id == job_id:
+                self._cancel_pending_locked()
             return job.snapshot()
 
     def wait(self, job_id: str, timeout: float | None = None) -> SweepJobSnapshot:
@@ -283,6 +313,19 @@ class SweepJobManager:
         with self._lock:
             return self._cleanup_locked()
 
+    def shutdown(self, wait: bool = False, cancel_futures: bool = True) -> None:
+        with self._lock:
+            self._shutdown = True
+            executing = self._executing_job_locked()
+            if executing is not None:
+                executing._request_cancel()
+            pending = self._pending_job_locked()
+            if pending is not None:
+                pending._request_cancel()
+                if cancel_futures:
+                    self._cancel_pending_locked()
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
     def _run_job[P](
         self,
         job: SweepJob,
@@ -290,7 +333,14 @@ class SweepJobManager:
         runner: Callable[[SweepJob, P], object],
     ) -> None:
         try:
-            if not job._mark_running(self._clock()):
+            with self._lock:
+                if self._pending_id == job.id:
+                    self._pending_id = None
+                if self._executing_id not in (None, job.id):
+                    raise RuntimeError("multiple sweep jobs attempted to execute")
+                self._executing_id = job.id
+                should_run = job._mark_running(self._clock())
+            if not should_run:
                 return
             try:
                 result = runner(job, payload)
@@ -299,18 +349,45 @@ class SweepJobManager:
                 job._mark_failed(exc, self._clock())
         finally:
             with self._lock:
-                if self._active_id == job.id:
-                    self._active_id = None
+                if self._executing_id == job.id:
+                    self._executing_id = None
+                if self._pending_id == job.id:
+                    self._pending_id = None
                 self._cleanup_locked()
 
-    def _active_job_locked(self) -> SweepJob | None:
-        if self._active_id is None:
+    def _executing_job_locked(self) -> SweepJob | None:
+        if self._executing_id is None:
             return None
-        active = self._jobs.get(self._active_id)
-        if active is None or active.snapshot().status in _TERMINAL_STATUSES:
-            self._active_id = None
+        executing = self._jobs.get(self._executing_id)
+        if executing is None or executing.snapshot().status in _TERMINAL_STATUSES:
+            self._executing_id = None
             return None
-        return active
+        return executing
+
+    def _pending_job_locked(self) -> SweepJob | None:
+        if self._pending_id is None:
+            return None
+        pending = self._jobs.get(self._pending_id)
+        if pending is None or pending.snapshot().status in _TERMINAL_STATUSES:
+            self._pending_id = None
+            return None
+        return pending
+
+    def _cancel_pending_locked(self) -> SweepJob | None:
+        pending = self._pending_job_locked()
+        if pending is None:
+            return None
+        pending._request_cancel()
+        future = self._futures[pending.id]
+        if future.cancel():
+            pending._mark_cancelled(self._clock())
+            self._pending_id = None
+        else:
+            self._pending_id = None
+            if self._executing_id not in (None, pending.id):
+                raise RuntimeError("pending sweep started while another sweep was executing")
+            self._executing_id = pending.id
+        return pending
 
     def _job_locked(self, job_id: str) -> SweepJob:
         try:
@@ -321,10 +398,13 @@ class SweepJobManager:
     def _cleanup_locked(self, reserve: int = 0) -> int:
         now = self._clock()
         removed = 0
+        self._executing_job_locked()
+        self._pending_job_locked()
+        protected = {self._executing_id, self._pending_id} - {None}
         removable = [
             job_id
             for job_id, job in self._jobs.items()
-            if job_id != self._active_id
+            if job_id not in protected
             and (snapshot := job.snapshot()).status in _TERMINAL_STATUSES
             and snapshot.finished_at is not None
             and now - snapshot.finished_at >= self._retention_seconds
@@ -338,7 +418,7 @@ class SweepJobManager:
             candidates = [
                 (snapshot.finished_at, snapshot.created_at, job_id)
                 for job_id, job in self._jobs.items()
-                if job_id != self._active_id
+                if job_id not in protected
                 and (snapshot := job.snapshot()).status in _TERMINAL_STATUSES
             ]
             if not candidates:
@@ -350,5 +430,9 @@ class SweepJobManager:
         return removed
 
     def _drop_job_locked(self, job_id: str) -> None:
+        if self._executing_id == job_id:
+            self._executing_id = None
+        if self._pending_id == job_id:
+            self._pending_id = None
         self._jobs.pop(job_id, None)
         self._futures.pop(job_id, None)

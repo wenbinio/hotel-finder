@@ -1,7 +1,9 @@
+import math
 import time
 from collections.abc import Callable, Hashable
+from concurrent.futures import Future
 from dataclasses import dataclass
-from threading import Event, Lock
+from threading import Lock, get_ident
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +18,12 @@ class _Entry[V]:
     expires_at: float
 
 
+@dataclass(slots=True)
+class _Flight[V]:
+    future: Future[V]
+    owner_thread_id: int
+
+
 class TTLCache[K: Hashable, V]:
     def __init__(
         self,
@@ -25,14 +33,13 @@ class TTLCache[K: Hashable, V]:
     ) -> None:
         if max_entries <= 0:
             raise ValueError("max_entries must be positive")
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        self._ensure_valid_ttl(ttl_seconds)
 
         self._max_entries = max_entries
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._entries: dict[K, _Entry[V]] = {}
-        self._inflight: dict[K, Event] = {}
+        self._inflight: dict[K, _Flight[V]] = {}
         self._lock = Lock()
 
     def get(self, key: K) -> CacheResult[V] | None:
@@ -66,31 +73,41 @@ class TTLCache[K: Hashable, V]:
                 if cached is not None:
                     return cached
 
-                pending = self._inflight.get(key)
-                if pending is None:
-                    pending = Event()
-                    self._inflight[key] = pending
+                flight = self._inflight.get(key)
+                if flight is None:
+                    flight = _Flight(future=Future(), owner_thread_id=get_ident())
+                    self._inflight[key] = flight
                     owner = True
                 else:
+                    if flight.owner_thread_id == get_ident():
+                        raise RuntimeError(f"recursive get_or_load for key {key!r}")
                     owner = False
 
             if not owner:
-                pending.wait()
-                continue
+                return CacheResult(value=flight.future.result(), hit=True)
 
             try:
                 value = loader()
                 self.set(key, value, ttl_seconds=ttl)
+            except BaseException as exc:
+                flight.future.set_exception(exc)
+                raise
+            else:
+                flight.future.set_result(value)
                 return CacheResult(value=value, hit=False)
             finally:
                 with self._lock:
-                    completed = self._inflight.pop(key, None)
-                    if completed is not None:
-                        completed.set()
+                    if self._inflight.get(key) is flight:
+                        del self._inflight[key]
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+
+    def size(self) -> int:
+        with self._lock:
+            self._evict_expired_locked(self._clock())
+            return len(self._entries)
 
     def _get_locked(self, key: K, now: float) -> CacheResult[V] | None:
         entry = self._entries.get(key)
@@ -108,6 +125,12 @@ class TTLCache[K: Hashable, V]:
 
     def _validated_ttl(self, ttl_seconds: float | None) -> float:
         ttl = self._ttl_seconds if ttl_seconds is None else ttl_seconds
+        self._ensure_valid_ttl(ttl)
+        return ttl
+
+    @staticmethod
+    def _ensure_valid_ttl(ttl: float) -> None:
+        if not math.isfinite(ttl):
+            raise ValueError("ttl_seconds must be finite")
         if ttl <= 0:
             raise ValueError("ttl_seconds must be positive")
-        return ttl

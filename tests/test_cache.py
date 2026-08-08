@@ -1,5 +1,6 @@
+import time
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock
+from threading import Barrier, Event, Lock, Thread
 
 import pytest
 
@@ -41,51 +42,74 @@ def test_get_or_load_coalesces_same_key() -> None:
     assert sum(not result.hit for result in results) == 1
 
 
-def test_loader_exception_is_not_cached_and_wakes_waiters() -> None:
+def test_persistent_failure_is_shared_once_by_the_waiting_cohort_then_retryable() -> None:
     cache = TTLCache(max_entries=8, ttl_seconds=60)
-    first_started = Event()
+    owner_started = Event()
     release_failure = Event()
     calls_lock = Lock()
     calls = 0
-    active = 0
-    max_active = 0
 
     def loader() -> str:
-        nonlocal active, calls, max_active
+        nonlocal calls
         with calls_lock:
             calls += 1
             attempt = calls
-            active += 1
-            max_active = max(max_active, active)
+        owner_started.set()
+        assert release_failure.wait(2)
+        raise RuntimeError(f"failure {attempt}")
+
+    def capture_failure() -> RuntimeError:
         try:
-            if attempt == 1:
-                first_started.set()
-                assert release_failure.wait(2)
-                raise RuntimeError("temporary failure")
-            return "recovered"
-        finally:
-            with calls_lock:
-                active -= 1
+            cache.get_or_load("same", loader)
+        except RuntimeError as exc:
+            return exc
+        raise AssertionError("loader failure was not propagated")
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(cache.get_or_load, "same", loader) for _ in range(4)]
-        assert first_started.wait(1)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        owner = pool.submit(capture_failure)
+        assert owner_started.wait(1)
+        waiters_ready = Barrier(8)
+
+        def wait_for_owner() -> RuntimeError:
+            waiters_ready.wait(timeout=1)
+            return capture_failure()
+
+        waiters = [pool.submit(wait_for_owner) for _ in range(7)]
+        waiters_ready.wait(timeout=1)
+        time.sleep(0.05)
         release_failure.set()
+        errors = [owner.result(timeout=2)] + [future.result(timeout=2) for future in waiters]
 
-        failures = 0
-        values = []
-        for future in futures:
-            try:
-                values.append(future.result(timeout=2).value)
-            except RuntimeError as exc:
-                assert str(exc) == "temporary failure"
-                failures += 1
+    assert calls == 1
+    assert len({id(error) for error in errors}) == 1
+    assert str(errors[0]) == "failure 1"
+    assert cache.get("same") is None
+    assert cache.get_or_load("same", lambda: "recovered") == CacheResult(
+        value="recovered", hit=False
+    )
 
-    assert failures == 1
-    assert values == ["recovered"] * 3
-    assert calls == 2
-    assert max_active == 1
-    assert cache.get("same") == CacheResult(value="recovered", hit=True)
+
+def test_recursive_same_key_load_raises_instead_of_deadlocking() -> None:
+    cache = TTLCache(max_entries=8, ttl_seconds=60)
+    errors: list[BaseException] = []
+
+    def recurse() -> None:
+        try:
+            cache.get_or_load(
+                "same",
+                lambda: cache.get_or_load("same", lambda: "nested").value,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = Thread(target=recurse, daemon=True)
+    thread.start()
+    thread.join(timeout=0.5)
+
+    assert not thread.is_alive(), "recursive load deadlocked"
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "recursive" in str(errors[0]).lower()
 
 
 def test_different_keys_load_concurrently() -> None:
@@ -154,6 +178,19 @@ def test_capacity_evicts_live_entry_with_earliest_expiry() -> None:
     assert cache.get("new") == CacheResult(value=3, hit=True)
 
 
+def test_size_purges_expired_entries() -> None:
+    clock = FakeClock()
+    cache = TTLCache(max_entries=3, ttl_seconds=20, clock=clock)
+    cache.set("short", 1, ttl_seconds=2)
+    cache.set("long", 2, ttl_seconds=20)
+
+    clock.advance(3)
+
+    assert cache.size() == 1
+    assert cache.get("short") is None
+    assert cache.get("long") == CacheResult(value=2, hit=True)
+
+
 def test_clear_removes_cached_values() -> None:
     cache = TTLCache(max_entries=2, ttl_seconds=10)
     cache.set("hotel", "cached")
@@ -180,3 +217,21 @@ def test_set_rejects_non_positive_ttl_override() -> None:
 
     with pytest.raises(ValueError, match="ttl_seconds"):
         cache.set("hotel", "value", ttl_seconds=0)
+
+
+@pytest.mark.parametrize("ttl_seconds", [float("nan"), float("inf"), float("-inf")])
+def test_cache_rejects_non_finite_default_ttl(ttl_seconds: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        TTLCache(max_entries=2, ttl_seconds=ttl_seconds)
+
+
+@pytest.mark.parametrize("ttl_seconds", [float("nan"), float("inf"), float("-inf")])
+def test_cache_rejects_non_finite_ttl_override(ttl_seconds: float) -> None:
+    cache = TTLCache(max_entries=2, ttl_seconds=10)
+    loader_called = Event()
+
+    with pytest.raises(ValueError, match="finite"):
+        cache.set("hotel", "value", ttl_seconds=ttl_seconds)
+    with pytest.raises(ValueError, match="finite"):
+        cache.get_or_load("hotel", lambda: loader_called.set(), ttl_seconds=ttl_seconds)
+    assert not loader_called.is_set()
