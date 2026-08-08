@@ -143,14 +143,15 @@ def verify_static_tree(
             "index.html must directly reference manifest entry outputs: "
             + ", ".join(missing_index_references)
         )
-    html_asset_references = {
-        name for name in references if PurePosixPath(name).parts[0] == "assets"
+    normalized_public_files = {
+        normalized_output_path(name) for name in public_files
     }
-    outside_manifest = sorted(html_asset_references - declared_outputs)
-    if outside_manifest:
+    allowed_html_references = {"index.html", *declared_outputs, *normalized_public_files}
+    outside_whitelist = sorted(references - allowed_html_references)
+    if outside_whitelist:
         raise ValueError(
-            "index.html asset references outside reachable manifest graph: "
-            + ", ".join(outside_manifest)
+            "index.html references outside declared manifest/public outputs: "
+            + ", ".join(outside_whitelist)
         )
 
     expected_files = {
@@ -158,7 +159,7 @@ def verify_static_tree(
         MANIFEST_PATH,
         *references,
         *declared_outputs,
-        *(normalized_output_path(name) for name in public_files),
+        *normalized_public_files,
     }
     static_root = static.resolve()
     for name in expected_files:

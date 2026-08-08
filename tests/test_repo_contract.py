@@ -208,7 +208,7 @@ GRAPH_MANIFEST = {
         "imports": ["_vendor.js"],
         "dynamicImports": ["src/lazy.jsx"],
         "css": ["assets/entry.css"],
-        "assets": ["assets/logo.svg"],
+        "assets": ["assets/bundled-logo.svg"],
     },
     "_vendor.js": {
         "file": "assets/vendor.js",
@@ -227,7 +227,7 @@ GRAPH_FILES = (
     "icons.svg",
     "assets/entry.js",
     "assets/entry.css",
-    "assets/logo.svg",
+    "assets/bundled-logo.svg",
     "assets/vendor.js",
     "assets/vendor.css",
     "assets/font.woff2",
@@ -300,6 +300,27 @@ def test_static_verifier_rejects_html_asset_outside_manifest_graph(tmp_path: Pat
         verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
 
 
+def test_static_verifier_accepts_nested_public_asset_reference(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path, extra=("assets/logo.svg",))
+    (static / "index.html").write_text(
+        GRAPH_INDEX + '<img src="/assets/logo.svg">',
+        encoding="utf-8",
+    )
+    public_files = {*PUBLIC_FILES, "assets/logo.svg"}
+    result = verify_static.verify_static_tree(static, tracked, public_files)
+    assert result == verify_static.StaticVerification((), (), ())
+
+
+def test_static_verifier_rejects_tracked_root_reference_outside_whitelist(tmp_path: Path):
+    static, tracked = _graph_fixture(tmp_path, extra=("old.js",))
+    (static / "index.html").write_text(
+        GRAPH_INDEX + '<script src="/old.js"></script>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="outside.*old.js"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
+
+
 @pytest.mark.parametrize(
     "missing",
     ("assets/vendor.js", "assets/font.woff2", "assets/lazy.png"),
@@ -333,12 +354,12 @@ def test_static_verifier_requires_vite_manifest(tmp_path: Path):
         verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
 
 
-def test_static_verifier_reports_dangling_root_html_reference(tmp_path: Path):
+def test_static_verifier_rejects_unknown_root_html_reference(tmp_path: Path):
     static, tracked = _graph_fixture(tmp_path)
     index = static / "index.html"
     index.write_text(GRAPH_INDEX + '<img src="/missing-root.svg">', encoding="utf-8")
-    result = verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
-    assert result.missing == ("missing-root.svg",)
+    with pytest.raises(ValueError, match="outside.*missing-root.svg"):
+        verify_static.verify_static_tree(static, tracked, PUBLIC_FILES)
 
 
 def test_static_verifier_reports_orphan_generated_assets_but_not_root_files(tmp_path: Path):
