@@ -9,4 +9,8 @@ frontend/dist/
 .pytest_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 coverage.xml
+htmlcov/
+frontend/coverage/
+*.egg-info/
