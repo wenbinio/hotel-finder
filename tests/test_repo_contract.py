@@ -16,6 +16,16 @@ def test_frontend_source_and_hostable_build_are_tracked():
     assert (ROOT / "frontend" / "package-lock.json").is_file()
 
 
+def test_node_runtime_is_pinned_consistently():
+    node_version = (ROOT / ".node-version").read_text("utf-8").strip()
+    package = json.loads((ROOT / "frontend" / "package.json").read_text("utf-8"))
+    lock = json.loads((ROOT / "frontend" / "package-lock.json").read_text("utf-8"))
+
+    assert node_version == "22.22.2"
+    assert package["engines"]["node"] == node_version
+    assert lock["packages"][""]["engines"]["node"] == node_version
+
+
 def test_static_verifier_exists():
     assert (ROOT / "scripts" / "verify_static.py").is_file()
 
@@ -99,7 +109,7 @@ def test_ci_runs_every_local_gate():
         in ci
     )
     assert (
-        '      - uses: actions/setup-node@v4\n        with:\n          node-version: "22"'
+        '      - uses: actions/setup-node@v4\n        with:\n          node-version: "22.22.2"'
         in ci
     )
 

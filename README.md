@@ -8,7 +8,7 @@ An ordinary Render web service URL is publicly reachable. The included deploymen
 
 ## Windows setup
 
-Install Python 3.13 and Node.js 22.12 or newer, then run these commands from the repository root in PowerShell:
+Install Python 3.13 and Node.js 22.22.2 (the version pinned in `.node-version`), then run these commands from the repository root in PowerShell:
 
 ```powershell
 py -3.13 -m venv .venv
@@ -85,14 +85,16 @@ Leave `HOTEL_FINDER_ALLOWED_ORIGINS` unset for the same-origin browser default. 
 
 ## Protected remote deployment prerequisites
 
-The included `render.yaml` describes the required single threaded Gunicorn worker, but it does not make Render private. Do not create or update a remote deployment until an authentication-capable reverse proxy or access gateway protects the origin, or the service is restricted to a private network. Verify that the ordinary service URL cannot bypass that protection. If those controls are unavailable, use the local instructions above and connect only through your VPN.
+The included `render.yaml` describes the required runtime shape: one Gunicorn worker process with eight request threads. It does not make Render private. Do not create or update a remote deployment until an authentication-capable reverse proxy or access gateway protects the origin, or the service is restricted to a private network. Verify that the ordinary service URL cannot bypass that protection. Remote authentication is a deployment gate, not a later upgrade. If those controls are unavailable, use the local instructions above and connect only through your VPN.
 
 After those prerequisites are in place, commit the generated `static/` bundle and push the protected deployment branch:
 
 ```powershell
 git status
-git push origin main
+git push origin <protected-deployment-branch>
 ```
+
+Replace `<protected-deployment-branch>` with the reviewed branch configured for the protected service.
 
 Create the service from the repository blueprint, confirm that it uses `render.yaml`, and set only the environment variables above when needed. Render's health check is `/api/health`. Test that endpoint through the protected URL, then prove an unauthenticated request cannot reach the application directly before running a browser smoke test.
 
@@ -108,7 +110,7 @@ Then request <http://127.0.0.1:5001/api/health>. The container health check uses
 ## Troubleshooting
 
 - **`py -3.13` is unavailable:** install Python 3.13, reopen PowerShell, and recreate `.venv`.
-- **`npm ci` fails:** use Node 22.12 or newer and delete only `frontend/node_modules` before retrying `npm ci`.
+- **`npm ci` fails:** use the exact Node 22.22.2 version in `.node-version` and delete only `frontend/node_modules` before retrying `npm ci`.
 - **The page is old after a frontend edit:** run `npm run build:hostable`, then rerun `python scripts/verify_static.py --check` and inspect the `static/` diff before committing it.
 - **A sweep reports busy or disappears:** only one sweep can run; a restart clears the in-memory registry. Start a new bounded sweep after the existing one completes or is cancelled.
 - **Searches are empty or partial:** this can be an upstream timeout, rate limit, changed markup, or genuine lack of inventory. Retry later and verify directly with the provider; do not interpret an upstream failure as a price.
@@ -116,8 +118,9 @@ Then request <http://127.0.0.1:5001/api/health>. The container health check uses
 
 ## Future upgrade paths
 
-1. For durable personal history and jobs, replace the in-memory job/cache storage with SQLite while retaining the API contracts.
+Authentication and a non-bypassable access boundary remain prerequisites for any remote exposure; they are not optional future upgrades.
+
+1. For durable personal history and job records, persist them in SQLite while retaining the API contracts. Add schema migrations and startup recovery that marks interrupted jobs as aborted or explicitly requeues them; SQLite cannot resume an in-flight Python thread after restart.
 2. Add Playwright browser checks and provider contract monitors to detect markup or workflow changes early.
 3. Add Redis and multiple workers only when state must be shared across instances; do not do this for the current single-instance deployment.
-4. Put authentication and a reverse proxy in front of the service before any remote exposure.
-5. Add provider APIs, locales, currency handling, and real flight pricing as separately tested product work.
+4. Add provider APIs, locales, currency handling, and real flight pricing as separately tested product work.
