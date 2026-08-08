@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from datetime import date
@@ -356,6 +357,83 @@ def test_sweep_records_partial_failure_without_losing_success(app_factory):
             "source": "google",
         }
     ]
+
+
+def test_sweep_empty_success_plus_timeout_finishes_as_failed_job(app_factory):
+    def fake_search(location, *_args, **_kwargs):
+        if location == "Phuket":
+            raise UpstreamError("timeout", source="google", retryable=True)
+        return []
+
+    application = app_factory(SEARCH_HOTELS=fake_search)
+    created = start_sweep(application.test_client(), sampleCount=1)
+    manager = application.extensions["hotel_finder"]["job_manager"]
+
+    snapshot = manager.wait(created.json["jobId"], timeout=2)
+
+    assert snapshot.status == "failed"
+    assert snapshot.error["code"] == "timeout"
+    assert snapshot.result is None
+
+
+def test_sweep_all_timeouts_finishes_as_failed_job(app_factory):
+    def timeout(*_args, **_kwargs):
+        raise UpstreamError("timeout", source="google", retryable=True)
+
+    application = app_factory(SEARCH_HOTELS=timeout)
+    created = start_sweep(application.test_client(), sampleCount=1)
+    manager = application.extensions["hotel_finder"]["job_manager"]
+
+    snapshot = manager.wait(created.json["jobId"], timeout=2)
+
+    assert snapshot.status == "failed"
+    assert snapshot.error["code"] == "timeout"
+    assert snapshot.result is None
+
+
+def test_sweep_all_genuine_empty_finishes_completed(app_factory):
+    application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
+    created = start_sweep(application.test_client(), sampleCount=1)
+    manager = application.extensions["hotel_finder"]["job_manager"]
+
+    snapshot = manager.wait(created.json["jobId"], timeout=2)
+
+    assert snapshot.status == "completed"
+    assert snapshot.result["dates"][0]["hotel_count"] == 0
+    assert snapshot.warnings == ()
+
+
+def test_sweep_background_logs_preserve_initiating_request_and_job_ids(
+    app_factory, caplog
+):
+    application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
+    client = application.test_client()
+
+    with caplog.at_level(logging.INFO, logger=application.logger.name):
+        created = client.post(
+            "/api/cheapest-dates",
+            json={
+                "locations": ["Bangkok"],
+                "startDate": "2026-08-10",
+                "endDate": "2026-08-11",
+                "sampleCount": 1,
+            },
+            headers={"X-Request-ID": "sweep-request-42"},
+        )
+        manager = application.extensions["hotel_finder"]["job_manager"]
+        assert manager.wait(created.json["jobId"], timeout=2).status == "completed"
+
+    lifecycle = [
+        record
+        for record in caplog.records
+        if record.getMessage() in {"sweep_started", "sweep_finished"}
+    ]
+    assert [record.getMessage() for record in lifecycle] == [
+        "sweep_started",
+        "sweep_finished",
+    ]
+    assert {record.request_id for record in lifecycle} == {"sweep-request-42"}
+    assert {record.job_id for record in lifecycle} == {created.json["jobId"]}
 
 
 def test_legacy_sweep_progress_route_reflects_manager_snapshot(app_factory):

@@ -7,7 +7,14 @@ from datetime import date
 import pytest
 
 import app as app_module
-from app import UpstreamError, call_with_retry, create_app, fetch_provider_prices, search_hotels
+from app import (
+    UpstreamError,
+    call_with_retry,
+    create_app,
+    fetch_provider_prices,
+    fetch_xotelo_prices,
+    search_hotels,
+)
 
 HOTEL_HTML = """
 <html><body><div class="uaTTDe">
@@ -25,6 +32,16 @@ class FakeResponse:
         self.status_code = status_code
         self.text = text
         self.headers = headers or {"content-type": "text/html; charset=utf-8"}
+
+
+class JsonResponse:
+    def __init__(self, payload, status_code=200, headers=None):
+        self.payload = payload
+        self.status_code = status_code
+        self.headers = headers or {"content-type": "application/json"}
+
+    def json(self):
+        return self.payload
 
 
 class SequenceClient:
@@ -178,6 +195,22 @@ def test_search_rejects_unexpected_content(app_factory):
     assert caught.value.code == "unexpected_content"
 
 
+def test_search_rejects_generic_maintenance_html_without_caching_it(app_factory):
+    client = SequenceClient(
+        [FakeResponse(text="<html><h1>Scheduled maintenance</h1></html>"), FakeResponse()]
+    )
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+        hotels = search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5)
+
+    assert caught.value.code == "unexpected_content"
+    assert hotels[0]["name"] == "Test Grand Hotel"
+    assert len(client.calls) == 2
+
+
 def test_search_does_not_treat_google_challenge_html_as_empty_inventory(app_factory):
     client = SequenceClient(
         [
@@ -233,6 +266,24 @@ def test_genuine_empty_search_is_cached_for_only_sixty_seconds(app_factory):
     assert len(client.calls) == 2
 
 
+def test_structurally_recognized_search_with_only_filtered_cards_is_empty(
+    app_factory,
+):
+    html = """
+    <html><body><div class="result uaTTDe sponsored">
+      <h2 class="BgYkof">Three Star Hotel</h2>
+      <span class="ne5qie Ih19Ad">3-star hotel</span><span>$120</span>
+    </div></body></html>
+    """
+    client = SequenceClient([FakeResponse(text=html)])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        assert search_hotels("Bangkok", "2026-08-10", "2026-08-11", 5) == []
+
+    assert len(client.calls) == 1
+
+
 def test_provider_rejects_bad_url_before_constructing_request(app_factory):
     client = SequenceClient([])
     application = app_factory(CLIENT_FACTORY=lambda: client)
@@ -282,6 +333,50 @@ def test_provider_manually_follows_one_revalidated_google_redirect(app_factory):
     ]
 
 
+def test_provider_rejects_generic_maintenance_html_without_caching_it(app_factory):
+    provider_html = r"<html>Agoda \u0024180</html>"
+    client = SequenceClient(
+        [
+            FakeResponse(
+                text="<html><h1>No availability during scheduled maintenance</h1></html>"
+            ),
+            FakeResponse(text=provider_html),
+        ]
+    )
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_provider_prices(
+                "https://www.google.com/travel/hotels/entity/maintenance"
+            )
+        providers = fetch_provider_prices(
+            "https://www.google.com/travel/hotels/entity/maintenance"
+        )
+
+    assert caught.value.code == "unexpected_content"
+    assert providers == {"agoda": 180.0}
+    assert len(client.calls) == 2
+
+
+def test_provider_caches_structurally_recognized_genuine_empty(app_factory):
+    html = "<html><main data-google-hotel-entity>No prices available</main></html>"
+    client = SequenceClient([FakeResponse(text=html)])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        first = fetch_provider_prices(
+            "https://www.google.com/travel/hotels/entity/no-rates"
+        )
+        second = fetch_provider_prices(
+            "https://www.google.com/travel/hotels/entity/no-rates"
+        )
+
+    assert first == {}
+    assert second == {}
+    assert len(client.calls) == 1
+
+
 def test_provider_cache_expires_after_nine_hundred_seconds(app_factory):
     clock = FakeClock()
     html = r"<html>Agoda \u0024180</html>"
@@ -307,6 +402,26 @@ def test_provider_cache_expires_after_nine_hundred_seconds(app_factory):
     assert len(client.calls) == 2
 
 
+def test_provider_request_replaces_stale_url_dates_with_authoritative_dates(
+    app_factory,
+):
+    provider_html = r"<html>Agoda \u0024180</html>"
+    client = SequenceClient([FakeResponse(text=provider_html)])
+    application = app_factory(CLIENT_FACTORY=lambda: client)
+
+    with application.app_context():
+        fetch_provider_prices(
+            "https://www.google.com/travel/hotels/entity/test?checkin=2026-09-01&checkout=2026-09-02",
+            checkin="2026-08-10",
+            checkout="2026-08-14",
+        )
+
+    url, options = client.calls[0]
+    assert "2026-09" not in url
+    assert options["params"]["checkin"] == "2026-08-10"
+    assert options["params"]["checkout"] == "2026-08-14"
+
+
 def test_call_with_retry_waits_once_with_jitter_and_never_after_success(app_factory):
     sleeps = []
     rng = DeterministicRng(0.1)
@@ -327,6 +442,146 @@ def test_call_with_retry_waits_once_with_jitter_and_never_after_success(app_fact
     assert attempts == 2
     assert sleeps == [0.35]
     assert rng.calls == [(0, 0.25)]
+
+
+def test_call_with_retry_stops_before_jitter_and_retry_when_cancelled(app_factory):
+    cancelled = threading.Event()
+    sleeps = []
+    rng = DeterministicRng(0.1)
+    application = app_factory(SLEEP=sleeps.append, RNG=rng)
+    attempts = 0
+
+    def transient_then_cancel():
+        nonlocal attempts
+        attempts += 1
+        cancelled.set()
+        raise UpstreamError("rate_limited", source="google", retryable=True)
+
+    with application.app_context(), pytest.raises(UpstreamError) as caught:
+        call_with_retry(transient_then_cancel, cancelled=cancelled.is_set)
+
+    assert caught.value.code == "rate_limited"
+    assert attempts == 1
+    assert sleeps == []
+    assert rng.calls == []
+
+
+def test_xotelo_cache_is_full_key_ttl_bounded_and_returns_detached_copies(app_factory):
+    clock = FakeClock()
+    payload = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0, "tax": 4.0}
+            ]
+        }
+    }
+    client = SequenceClient([JsonResponse(payload), JsonResponse(payload), JsonResponse(payload)])
+    application = app_factory(CLOCK=clock, XOTELO_CLIENT=client)
+
+    with application.app_context():
+        first = fetch_xotelo_prices(
+            "ta-key", "Hotel One", "2026-08-10", "2026-08-11"
+        )
+        first["Agoda"]["rate"] = 1.0
+        cached = fetch_xotelo_prices(
+            "ta-key", "Hotel Two", "2026-08-10", "2026-08-11"
+        )
+        different_dates = fetch_xotelo_prices(
+            "ta-key", "Hotel One", "2026-08-10", "2026-08-12"
+        )
+        clock.advance(901)
+        expired = fetch_xotelo_prices(
+            "ta-key", "Hotel One", "2026-08-10", "2026-08-11"
+        )
+
+    assert cached["Agoda"]["rate"] == 88.0
+    assert "Hotel+Two" in cached["Agoda"]["url"]
+    assert different_dates["Agoda"]["rate"] == 88.0
+    assert expired["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 3
+    timeout = client.calls[0][1]["timeout"]
+    assert timeout.total == 15
+    assert timeout.connect_timeout == 5
+
+
+def test_xotelo_uses_one_attempt_and_does_not_cache_failure(app_factory):
+    payload = {
+        "result": {
+            "rates": [
+                {"name": "Agoda", "code": "Agoda", "rate": 88.0, "tax": 0}
+            ]
+        }
+    }
+    client = SequenceClient(
+        [JsonResponse({}, status_code=503), JsonResponse(payload)]
+    )
+    sleeps = []
+    application = app_factory(XOTELO_CLIENT=client, SLEEP=sleeps.append)
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        result = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "upstream_unavailable"
+    assert result["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+    assert sleeps == []
+
+
+def test_xotelo_cache_key_preserves_tripadvisor_key_identity(app_factory):
+    first_payload = {
+        "result": {
+            "rates": [{"name": "Agoda", "code": "Agoda", "rate": 88.0}]
+        }
+    }
+    second_payload = {
+        "result": {
+            "rates": [{"name": "Agoda", "code": "Agoda", "rate": 99.0}]
+        }
+    }
+    client = SequenceClient(
+        [JsonResponse(first_payload), JsonResponse(second_payload)]
+    )
+    application = app_factory(XOTELO_CLIENT=client)
+
+    with application.app_context():
+        numeric_key = fetch_xotelo_prices(
+            7, "Hotel", "2026-08-10", "2026-08-11"
+        )
+        string_key = fetch_xotelo_prices(
+            "7", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert numeric_key["Agoda"]["rate"] == 88.0
+    assert string_key["Agoda"]["rate"] == 99.0
+    assert len(client.calls) == 2
+
+
+def test_default_client_factory_is_thread_local_per_application(app_factory, monkeypatch):
+    created = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+    monkeypatch.setattr(app_module, "Client", FakeClient)
+    first_app = app_factory()
+    second_app = app_factory()
+
+    first_factory = first_app.extensions["hotel_finder"]["client_factory"]
+    second_factory = second_app.extensions["hotel_finder"]["client_factory"]
+    first_client = first_factory()
+    second_client = second_factory()
+
+    assert first_factory() is first_client
+    assert second_factory() is second_client
+    assert first_client is not second_client
+    assert len(created) == 2
 
 
 def test_process_google_semaphore_clamps_configured_capacity(app_factory, monkeypatch):

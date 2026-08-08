@@ -41,6 +41,32 @@ def test_only_one_active_job_and_cancel_is_cooperative() -> None:
     assert manager.wait(first.id, timeout=2).status == "cancelled"
 
 
+def test_cancel_atomically_blocks_late_public_progress_partials_and_warnings() -> None:
+    entered = Event()
+    publish = Event()
+
+    def runner(job, _payload):
+        entered.set()
+        assert publish.wait(2)
+        job.set_progress(completed=1, total=1)
+        job.add_partial({"checkin": "2026-08-10"})
+        job.add_warning({"code": "late"})
+        return {"ignored": True}
+
+    manager = SweepJobManager()
+    job = manager.start({}, runner)
+    assert entered.wait(1)
+    cancelled = manager.cancel(job.id)
+    publish.set()
+    final = manager.wait(job.id, timeout=2)
+
+    assert cancelled.cancel_requested is True
+    assert final.status == "cancelled"
+    assert final.progress == {"completed": 0, "total": 0}
+    assert final.partial == ()
+    assert final.warnings == ()
+
+
 def test_cancel_request_wins_over_runner_result() -> None:
     entered = Event()
     release = Event()

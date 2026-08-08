@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
+import math
 import os
 import random
 import re
@@ -14,14 +17,21 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import date
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from fast_hotels.hotels_impl import Guests, HotelData, THSData
 from fast_hotels.primp import Client
 from flask import Flask, current_app, g, jsonify, request, send_from_directory
+from flask.json.provider import DefaultJSONProvider
 from flask_cors import CORS
-from werkzeug.exceptions import BadRequest, UnsupportedMediaType
+from requests.adapters import TimeoutSauce
+from werkzeug.exceptions import (
+    BadRequest,
+    MethodNotAllowed,
+    NotFound,
+    UnsupportedMediaType,
+)
 
 from hotel_finder import __version__
 from hotel_finder.cache import TTLCache
@@ -51,6 +61,7 @@ MAX_UPSTREAM_CONCURRENCY = 6
 SEARCH_CACHE_SECONDS = 600
 EMPTY_SEARCH_CACHE_SECONDS = 60
 PROVIDER_CACHE_SECONDS = 900
+XOTELO_CACHE_SECONDS = 900
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
@@ -101,6 +112,35 @@ except (OSError, ValueError):
     _TA_KEYS = {}
 
 _client_local = threading.local()
+
+
+class _StrictJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj: object, **kwargs: object) -> str:
+        kwargs["allow_nan"] = False
+        return super().dumps(obj, **kwargs)
+
+
+class _HotelFinderFlask(Flask):
+    json_provider_class = _StrictJSONProvider
+
+
+class _StructuredFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "event": record.getMessage(),
+        }
+        for field in (
+            "request_id",
+            "job_id",
+            "request_method",
+            "request_path",
+            "response_status",
+        ):
+            if hasattr(record, field):
+                payload[field] = getattr(record, field)
+        return json.dumps(payload, allow_nan=False, separators=(",", ":"))
 
 
 class InvalidJSON(ValueError):
@@ -156,6 +196,24 @@ def make_client() -> Client:
     return _client_local.client
 
 
+def _thread_local_client_factory() -> Callable[[], Client]:
+    local = threading.local()
+
+    def factory() -> Client:
+        if not hasattr(local, "client"):
+            local.client = Client(
+                impersonate=IMPERSONATE_PROFILE,
+                verify=True,
+                connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                read_timeout=READ_TIMEOUT_SECONDS,
+                timeout=TOTAL_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            )
+        return local.client
+
+    return factory
+
+
 def _services() -> dict[str, Any]:
     return current_app.extensions["hotel_finder"]
 
@@ -168,11 +226,60 @@ def _bounded_upstream_limit(value: object) -> int:
     return max(1, min(MAX_UPSTREAM_CONCURRENCY, configured))
 
 
+def _ensure_json_safe(value: object, *, source: str) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise UpstreamError(
+            "unexpected_content", source=source, retryable=False
+        )
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise UpstreamError(
+                "unexpected_content", source=source, retryable=False
+            )
+        for nested in value.values():
+            _ensure_json_safe(nested, source=source)
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for nested in value:
+            _ensure_json_safe(nested, source=source)
+        return
+    raise UpstreamError("unexpected_content", source=source, retryable=False)
+
+
+def _validated_hotels(value: object, *, source: str = "google") -> list[dict[str, Any]]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise UpstreamError("unexpected_content", source=source, retryable=False)
+    hotels: list[dict[str, Any]] = []
+    for hotel in value:
+        if not isinstance(hotel, Mapping):
+            raise UpstreamError(
+                "unexpected_content", source=source, retryable=False
+            )
+        copied = dict(hotel)
+        _ensure_json_safe(copied, source=source)
+        hotels.append(copied)
+    return hotels
+
+
 def _freeze_hotels(hotels: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
-    return tuple(
-        json.dumps(dict(hotel), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        for hotel in hotels
-    )
+    frozen: list[str] = []
+    for hotel in hotels:
+        copied = dict(hotel)
+        _ensure_json_safe(copied, source="google")
+        frozen.append(
+            json.dumps(
+                copied,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    return tuple(frozen)
 
 
 def _copy_hotels(frozen: Sequence[str]) -> list[dict[str, Any]]:
@@ -213,17 +320,66 @@ def _response_html(response: object, source: str) -> str:
     return text
 
 
-def call_with_retry[T](operation: Callable[[], T]) -> T:
+def _recognized_search_page(html: str, hotels: Sequence[object]) -> bool:
+    if hotels:
+        return True
+    normalized = html.casefold()
+    if re.search(r'''class\s*=\s*["'][^"']*\buattde\b[^"']*["']''', normalized):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "data-google-hotels-search",
+            "no available properties",
+            "no properties found",
+            "no hotels found",
+            "no results found",
+        )
+    )
+
+
+def _recognized_provider_page(
+    html: str, prices: Mapping[str, float]
+) -> bool:
+    if prices:
+        return True
+    normalized = html.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "data-google-hotel-entity",
+            "/travel/hotels/entity/",
+            "no prices available",
+            "no booking options",
+        )
+    )
+
+
+def call_with_retry[T](
+    operation: Callable[[], T], *, cancelled: Callable[[], bool] | None = None
+) -> T:
     """Run an upstream operation with no more than one transient retry."""
     services = _services()
+    is_cancelled = cancelled or (lambda: False)
     for attempt in range(2):
+        if is_cancelled():
+            raise UpstreamError(
+                "upstream_failure",
+                "The upstream operation was cancelled.",
+                source="internal",
+                retryable=False,
+            )
         try:
             return operation()
         except UpstreamError as error:
-            if attempt == 1 or not error.retryable:
+            if attempt == 1 or not error.retryable or is_cancelled():
                 raise
             delay = 0.25 + services["rng"].uniform(0, 0.25)
+            if is_cancelled():
+                raise error
             services["sleep"](delay)
+            if is_cancelled():
+                raise error
     raise RuntimeError("unreachable retry state")
 
 
@@ -233,6 +389,7 @@ def _request_upstream(
     params: Mapping[str, object],
     source: str,
     return_redirect: bool = False,
+    cancelled: Callable[[], bool] | None = None,
 ) -> object:
     services = _services()
 
@@ -269,7 +426,7 @@ def _request_upstream(
             )
         return response
 
-    return call_with_retry(operation)
+    return call_with_retry(operation, cancelled=cancelled)
 
 
 def _safe_parsed_hotels(
@@ -297,7 +454,12 @@ def _safe_parsed_hotels(
 
 
 def search_hotels(
-    location: str, checkin: str, checkout: str, min_stars: int = 5
+    location: str,
+    checkin: str,
+    checkout: str,
+    min_stars: int = 5,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Search Google Hotels through the per-app cache and upstream gate."""
     normalized_location = location.strip()
@@ -332,13 +494,17 @@ def search_hotels(
             f"https://www.google.com/travel/hotels/{city}",
             params=params,
             source="google",
+            cancelled=cancelled,
         )
         html = _response_html(response, "google")
-        return _freeze_hotels(
-            _safe_parsed_hotels(
-                html, normalized_location, checkin, checkout, int(min_stars)
-            )
+        hotels = _safe_parsed_hotels(
+            html, normalized_location, checkin, checkout, int(min_stars)
         )
+        if not _recognized_search_page(html, hotels):
+            raise UpstreamError(
+                "unexpected_content", source="google", retryable=False
+            )
+        return _freeze_hotels(hotels)
 
     loaded = cache.get_or_load(key, load, ttl_seconds=EMPTY_SEARCH_CACHE_SECONDS)
     if not loaded.hit and loaded.value:
@@ -346,18 +512,48 @@ def search_hotels(
     return _copy_hotels(loaded.value)
 
 
-def fetch_provider_prices(entity_url: str) -> dict[str, float]:
+def _authoritative_google_url(
+    canonical_url: str, checkin: str | None, checkout: str | None
+) -> str:
+    if checkin is None and checkout is None:
+        return canonical_url
+    parts = urlsplit(canonical_url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.casefold() not in {"checkin", "checkout"}
+    ]
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), "")
+    )
+
+
+def fetch_provider_prices(
+    entity_url: str,
+    *,
+    checkin: str | None = None,
+    checkout: str | None = None,
+) -> dict[str, float]:
     """Fetch a validated Google entity page and parse provider prices."""
-    canonical_url = validate_google_hotel_url(entity_url)
+    canonical_url = _authoritative_google_url(
+        validate_google_hotel_url(entity_url), checkin, checkout
+    )
     cache = _services()["provider_cache"]
-    cached = cache.get(canonical_url)
+    cache_key = (canonical_url, checkin or "", checkout or "", "USD")
+    cached = cache.get(cache_key)
     if cached is not None:
         return dict(cached.value)
+
+    request_params = {"hl": "en", "curr": "USD"}
+    if checkin is not None:
+        request_params["checkin"] = checkin
+    if checkout is not None:
+        request_params["checkout"] = checkout
 
     def load() -> tuple[tuple[str, float], ...]:
         response = _request_upstream(
             canonical_url,
-            params={"hl": "en", "curr": "USD"},
+            params=request_params,
             source="google_provider",
             return_redirect=True,
         )
@@ -370,14 +566,16 @@ def fetch_provider_prices(entity_url: str) -> dict[str, float]:
                 )
             target = urljoin(canonical_url, location)
             try:
-                target = validate_google_hotel_url(target)
+                target = _authoritative_google_url(
+                    validate_google_hotel_url(target), checkin, checkout
+                )
             except ValidationProblem as error:
                 raise UpstreamError(
                     "unsafe_redirect", source="google_provider", retryable=False
                 ) from error
             response = _request_upstream(
                 target,
-                params={"hl": "en", "curr": "USD"},
+                params=request_params,
                 source="google_provider",
                 return_redirect=True,
             )
@@ -386,10 +584,20 @@ def fetch_provider_prices(entity_url: str) -> dict[str, float]:
                     "redirect", source="google_provider", retryable=False
                 )
         html = _response_html(response, "google_provider")
-        return tuple(sorted(parse_provider_prices(html).items()))
+        prices = parse_provider_prices(html)
+        if not _recognized_provider_page(html, prices):
+            raise UpstreamError(
+                "unexpected_content", source="google_provider", retryable=False
+            )
+        for price in prices.values():
+            if not isinstance(price, (int, float)) or not math.isfinite(float(price)):
+                raise UpstreamError(
+                    "unexpected_content", source="google_provider", retryable=False
+                )
+        return tuple(sorted(prices.items()))
 
     loaded = cache.get_or_load(
-        canonical_url, load, ttl_seconds=PROVIDER_CACHE_SECONDS
+        cache_key, load, ttl_seconds=PROVIDER_CACHE_SECONDS
     )
     return dict(loaded.value)
 
@@ -495,10 +703,12 @@ def fetch_xotelo_prices(
     checkout: str,
     currency: str = "USD",
 ) -> dict[str, dict[str, object]]:
-    """Fetch the legacy Xotelo rates with bounded retries and explicit timeouts."""
+    """Fetch cached legacy Xotelo rates with one total-deadline-bounded attempt."""
     services = _services()
+    cache = services["xotelo_cache"]
+    key = (hotel_key, checkin, checkout, currency, "xotelo")
 
-    def operation() -> object:
+    def load() -> tuple[tuple[str, str, float, float], ...]:
         try:
             with services["upstream_semaphore"]:
                 response = services["xotelo_client"].get(
@@ -509,16 +719,22 @@ def fetch_xotelo_prices(
                         "chk_out": checkout,
                         "currency": currency,
                     },
-                    timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
+                    timeout=TimeoutSauce(
+                        connect=CONNECT_TIMEOUT_SECONDS,
+                        read=READ_TIMEOUT_SECONDS,
+                        total=TOTAL_TIMEOUT_SECONDS,
+                    ),
                     allow_redirects=False,
                 )
-        except requests.Timeout as error:
+        except Exception as error:
+            is_timeout = (
+                isinstance(error, (requests.Timeout, TimeoutError))
+                or "timeout" in type(error).__name__.casefold()
+            )
             raise UpstreamError(
-                "timeout", source="xotelo", retryable=True
-            ) from error
-        except requests.RequestException as error:
-            raise UpstreamError(
-                "transport", source="xotelo", retryable=True
+                "timeout" if is_timeout else "transport",
+                source="xotelo",
+                retryable=True,
             ) from error
         status_code = getattr(response, "status_code", None)
         if status_code == 429:
@@ -533,32 +749,55 @@ def fetch_xotelo_prices(
             raise UpstreamError(
                 "upstream_response", source="xotelo", retryable=False
             )
-        return response
+        try:
+            payload = response.json()
+            rates = payload.get("result", {}).get("rates", [])
+        except (AttributeError, TypeError, ValueError) as error:
+            raise UpstreamError(
+                "unexpected_content", source="xotelo", retryable=False
+            ) from error
+        if not isinstance(rates, list):
+            raise UpstreamError(
+                "unexpected_content", source="xotelo", retryable=False
+            )
+        frozen_rates: list[tuple[str, str, float, float]] = []
+        for raw_rate in rates:
+            if not isinstance(raw_rate, Mapping) or not raw_rate.get("name"):
+                continue
+            raw_value = raw_rate.get("rate")
+            if raw_value in (None, 0):
+                continue
+            raw_tax = raw_rate.get("tax", 0)
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, (int, float))
+                or isinstance(raw_tax, bool)
+                or not isinstance(raw_tax, (int, float))
+                or not math.isfinite(float(raw_value))
+                or not math.isfinite(float(raw_tax))
+            ):
+                raise UpstreamError(
+                    "unexpected_content", source="xotelo", retryable=False
+                )
+            frozen_rates.append(
+                (
+                    str(raw_rate["name"]),
+                    str(raw_rate.get("code", "")),
+                    float(raw_value),
+                    float(raw_tax),
+                )
+            )
+        return tuple(frozen_rates)
 
-    response = call_with_retry(operation)
-    try:
-        payload = response.json()
-        rates = payload.get("result", {}).get("rates", [])
-    except (AttributeError, TypeError, ValueError) as error:
-        raise UpstreamError(
-            "unexpected_content", source="xotelo", retryable=False
-        ) from error
-    if not isinstance(rates, list):
-        raise UpstreamError(
-            "unexpected_content", source="xotelo", retryable=False
-        )
-    result: dict[str, dict[str, object]] = {}
-    for rate in rates:
-        if not isinstance(rate, Mapping) or not rate.get("rate") or not rate.get("name"):
-            continue
-        result[str(rate["name"])] = {
-            "rate": rate["rate"],
-            "tax": rate.get("tax", 0),
-            "url": _ota_search_url(
-                str(rate.get("code", "")), hotel_name, checkin, checkout
-            ),
+    loaded = cache.get_or_load(key, load, ttl_seconds=XOTELO_CACHE_SECONDS)
+    return {
+        name: {
+            "rate": rate,
+            "tax": tax,
+            "url": _ota_search_url(code, hotel_name, checkin, checkout),
         }
-    return result
+        for name, code, rate, tax in loaded.value
+    }
 
 
 def _serialize_hotel_input(hotel: HotelInput) -> dict[str, object]:
@@ -593,9 +832,17 @@ def _serialize_sweep_request(sweep: SweepRequest) -> dict[str, object]:
 def _merge_provider_prices(
     google_prices: Mapping[str, float], xotelo_prices: Mapping[str, object]
 ) -> dict[str, dict[str, object]]:
-    merged: dict[str, dict[str, object]] = {
-        name: {"rate": price, "url": ""} for name, price in google_prices.items()
-    }
+    merged: dict[str, dict[str, object]] = {}
+    for name, price in google_prices.items():
+        if (
+            isinstance(price, bool)
+            or not isinstance(price, (int, float))
+            or not math.isfinite(float(price))
+        ):
+            raise UpstreamError(
+                "unexpected_content", source="google_provider", retryable=False
+            )
+        merged[name] = {"rate": float(price), "url": ""}
     normalizations = {
         "booking": "booking.com",
         "agoda": "agoda",
@@ -608,8 +855,13 @@ def _merge_provider_prices(
     for name, raw_info in xotelo_prices.items():
         info = raw_info if isinstance(raw_info, Mapping) else {"rate": raw_info}
         rate = info.get("rate")
-        if not isinstance(rate, (int, float)):
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
             continue
+        if not math.isfinite(float(rate)):
+            raise UpstreamError(
+                "unexpected_content", source="xotelo", retryable=False
+            )
+        rate = float(rate)
         url = info.get("url", "")
         key = name.lower().replace(".com", "").replace(" ", "").strip()
         normalized_name = next(
@@ -622,6 +874,74 @@ def _merge_provider_prices(
         elif not existing.get("url") and url:
             existing["url"] = url
     return merged
+
+
+def _google_provider_prices(value: object) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise UpstreamError(
+            "unexpected_content", source="google_provider", retryable=False
+        )
+    result: dict[str, float] = {}
+    for name, price in value.items():
+        if (
+            not isinstance(name, str)
+            or isinstance(price, bool)
+            or not isinstance(price, (int, float))
+            or not math.isfinite(float(price))
+        ):
+            raise UpstreamError(
+                "unexpected_content", source="google_provider", retryable=False
+            )
+        result[name] = float(price)
+    return result
+
+
+def _call_google_provider_prices(
+    provider_callable: Callable[..., object],
+    url: str,
+    checkin: str,
+    checkout: str,
+) -> dict[str, float]:
+    try:
+        parameters = inspect.signature(provider_callable).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    names = {parameter.name for parameter in parameters}
+    kwargs: dict[str, str] = {}
+    if accepts_kwargs or "checkin" in names:
+        kwargs["checkin"] = checkin
+    if accepts_kwargs or "checkout" in names:
+        kwargs["checkout"] = checkout
+    return _google_provider_prices(provider_callable(url, **kwargs))
+
+
+def _xotelo_provider_prices(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise UpstreamError(
+            "unexpected_content", source="xotelo", retryable=False
+        )
+    copied = dict(value)
+    _ensure_json_safe(copied, source="xotelo")
+    return copied
+
+
+def _provider_failure(error: Exception, source: str) -> UpstreamError:
+    if isinstance(error, UpstreamError):
+        if error.source == source:
+            return error
+        return UpstreamError(
+            error.code,
+            str(error),
+            source=source,
+            retryable=error.retryable,
+        )
+    return UpstreamError(
+        "upstream_failure", str(error), source=source, retryable=False
+    )
 
 
 def _json_body() -> Mapping[str, Any]:
@@ -644,6 +964,40 @@ def _search_callable() -> Callable[..., list[dict[str, Any]]]:
     return _services()["search_hotels"]
 
 
+def _call_search(
+    search_callable: Callable[..., object],
+    location: str,
+    checkin: str,
+    checkout: str,
+    min_stars: int,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
+    kwargs: dict[str, object] = {"min_stars": min_stars}
+    if cancelled is not None:
+        try:
+            parameters = inspect.signature(search_callable).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        if any(
+            parameter.name == "cancelled"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            kwargs["cancelled"] = cancelled
+    value = search_callable(location, checkin, checkout, **kwargs)
+    return _validated_hotels(value, source="google")
+
+
+def _representative_failure[T](
+    failures: Sequence[tuple[T, UpstreamError]],
+) -> UpstreamError:
+    return next(
+        (error for _item, error in failures if error.code == "timeout"),
+        failures[0][1],
+    )
+
+
 def _execute_sweep(job: SweepJob, sweep: SweepRequest) -> dict[str, object] | None:
     date_pairs = sample_stay_dates(
         sweep.start_date, sweep.end_date, sweep.nights, sweep.sample_count
@@ -652,6 +1006,8 @@ def _execute_sweep(job: SweepJob, sweep: SweepRequest) -> dict[str, object] | No
     completed_calls = 0
     date_results: list[dict[str, Any]] = []
     best_date_hotels: list[dict[str, Any]] = []
+    failures_seen: list[tuple[str, UpstreamError]] = []
+    saw_usable_data = False
     search_callable = _search_callable()
     job.set_progress(
         completed=0,
@@ -677,11 +1033,13 @@ def _execute_sweep(job: SweepJob, sweep: SweepRequest) -> dict[str, object] | No
         ) -> list[dict[str, Any]]:
             if job.cancel_requested:
                 return []
-            return search_callable(
+            return _call_search(
+                search_callable,
                 location,
                 search_checkin,
                 search_checkout,
-                min_stars=sweep.min_stars,
+                sweep.min_stars,
+                cancelled=lambda: job.cancel_requested,
             )
 
         def publish_completion(
@@ -716,6 +1074,8 @@ def _execute_sweep(job: SweepJob, sweep: SweepRequest) -> dict[str, object] | No
             return None
 
         all_hotels = [hotel for _location, hotels in successes for hotel in hotels]
+        saw_usable_data = saw_usable_data or bool(all_hotels)
+        failures_seen.extend(failures)
         all_hotels.sort(key=lambda hotel: float(hotel.get("price", float("inf"))))
         cheapest = all_hotels[0] if all_hotels else None
         result = {
@@ -740,20 +1100,23 @@ def _execute_sweep(job: SweepJob, sweep: SweepRequest) -> dict[str, object] | No
             )
         if job.cancel_requested:
             return None
-        job.add_partial(
-            {
-                "checkin": checkin,
-                "checkout": checkout,
-                "cheapest_price": result["cheapest_price"],
-                "cheapest_hotel": result["cheapest_hotel"],
-                "location": result["location"],
-                "hotel_count": result["hotel_count"],
-            }
-        )
+        if all_hotels or not failures:
+            job.add_partial(
+                {
+                    "checkin": checkin,
+                    "checkout": checkout,
+                    "cheapest_price": result["cheapest_price"],
+                    "cheapest_hotel": result["cheapest_hotel"],
+                    "location": result["location"],
+                    "hotel_count": result["hotel_count"],
+                }
+            )
         date_results.append(result)
 
     if job.cancel_requested:
         return None
+    if failures_seen and not saw_usable_data:
+        raise _representative_failure(failures_seen)
     valid_results = [
         result for result in date_results if result["cheapest_price"] is not None
     ]
@@ -802,13 +1165,12 @@ def _execute_sweep(job: SweepJob, sweep: SweepRequest) -> dict[str, object] | No
 def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
     """Create one process-local application runtime with injectable boundaries."""
     static_dir = Path(__file__).with_name("static")
-    application = Flask(
-        __name__,
-        static_folder=str(static_dir) if static_dir.is_dir() else None,
-        static_url_path="",
-    )
+    application = _HotelFinderFlask(__name__, static_folder=None)
     if test_config:
         application.config.update(test_config)
+    formatter = _StructuredFormatter()
+    for handler in application.logger.handlers:
+        handler.setFormatter(formatter)
 
     def configured(name: str, default: object) -> object:
         value = application.config.get(name)
@@ -832,19 +1194,27 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         provider_cache = TTLCache(
             max_entries=256, ttl_seconds=PROVIDER_CACHE_SECONDS, clock=clock
         )
+    xotelo_cache = application.config.get("XOTELO_CACHE")
+    if xotelo_cache is None:
+        xotelo_cache = TTLCache(
+            max_entries=256, ttl_seconds=XOTELO_CACHE_SECONDS, clock=clock
+        )
     job_manager = application.config.get("JOB_MANAGER")
     if job_manager is None:
         job_manager = SweepJobManager(clock=clock)
     application.extensions["hotel_finder"] = {
         "search_cache": search_cache,
         "provider_cache": provider_cache,
+        "xotelo_cache": xotelo_cache,
         "upstream_semaphore": threading.BoundedSemaphore(upstream_limit),
         "upstream_limit": upstream_limit,
         "job_manager": job_manager,
         "clock": clock,
         "sleep": configured("SLEEP", time.sleep),
         "rng": configured("RNG", random.Random()),
-        "client_factory": configured("CLIENT_FACTORY", make_client),
+        "client_factory": configured(
+            "CLIENT_FACTORY", _thread_local_client_factory()
+        ),
         "xotelo_client": configured("XOTELO_CLIENT", requests),
         "today": configured("TODAY_PROVIDER", date.today),
         "search_hotels": configured(
@@ -942,6 +1312,28 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
             status,
         )
 
+    @application.errorhandler(NotFound)
+    def handle_not_found(_error: NotFound):
+        if request.path.startswith("/api/"):
+            return _error_response(
+                "not_found",
+                "API route was not found.",
+                {"path": request.path},
+                404,
+            )
+        return "Not found", 404
+
+    @application.errorhandler(MethodNotAllowed)
+    def handle_method_not_allowed(_error: MethodNotAllowed):
+        if request.path.startswith("/api/"):
+            return _error_response(
+                "method_not_allowed",
+                "HTTP method is not allowed for this API route.",
+                {"path": request.path, "method": request.method},
+                405,
+            )
+        return "Method not allowed", 405
+
     @application.get("/api/destinations")
     def get_destinations():
         return jsonify(DESTINATIONS)
@@ -953,8 +1345,12 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         )
         checkin = query.checkin.isoformat()
         checkout = query.checkout.isoformat()
-        hotels = _search_callable()(
-            query.location, checkin, checkout, min_stars=query.min_stars
+        hotels = _call_search(
+            _search_callable(),
+            query.location,
+            checkin,
+            checkout,
+            query.min_stars,
         )
         return jsonify(
             {
@@ -983,8 +1379,12 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         search_callable = _search_callable()
 
         def search_location(location: str) -> list[dict[str, Any]]:
-            return search_callable(
-                location, checkin, checkout, min_stars=query.min_stars
+            return _call_search(
+                search_callable,
+                location,
+                checkin,
+                checkout,
+                query.min_stars,
             )
 
         successes, failures = run_bounded(
@@ -992,8 +1392,6 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
             search_location,
             max_workers=min(_services()["upstream_limit"], max(1, len(locations))),
         )
-        if failures and not successes:
-            raise failures[0][1]
         results = {"beachfront": [], "non_beachfront": []}
         for location, hotels in successes:
             for hotel in hotels:
@@ -1001,6 +1399,8 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
                 if category not in results:
                     category = DESTINATION_BY_NAME[location]["category"]
                 results[category].append(hotel)
+        if failures and not any(results.values()):
+            raise _representative_failure(failures)
         for category in results:
             results[category].sort(
                 key=lambda hotel: float(hotel.get("price", float("inf")))
@@ -1041,19 +1441,26 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         replace = payload.get("replace", False)
         if not isinstance(replace, bool):
             raise ValidationProblem({"replace": "must be a boolean"})
+        initiating_request_id = g.request_id
 
         def runner(job: SweepJob, request_payload: SweepRequest):
             with application.app_context():
                 application.logger.info(
                     "sweep_started",
-                    extra={"request_id": "background", "job_id": job.id},
+                    extra={
+                        "request_id": initiating_request_id,
+                        "job_id": job.id,
+                    },
                 )
                 try:
                     return _execute_sweep(job, request_payload)
                 finally:
                     application.logger.info(
                         "sweep_finished",
-                        extra={"request_id": "background", "job_id": job.id},
+                        extra={
+                            "request_id": initiating_request_id,
+                            "job_id": job.id,
+                        },
                     )
 
         manager: SweepJobManager = _services()["job_manager"]
@@ -1131,30 +1538,132 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
         resolve_tripadvisor = services["resolve_tripadvisor"]
         xotelo_prices_callable = services["xotelo_prices"]
 
-        def enrich(hotel: HotelInput) -> dict[str, object]:
+        def enrich(
+            hotel: HotelInput,
+        ) -> tuple[
+            dict[str, object], list[dict[str, str]], dict[str, str] | None
+        ]:
+            provider_warnings: list[dict[str, str]] = []
+            provider_errors: list[UpstreamError] = []
+            attempted_sources = 0
             google_prices: Mapping[str, float] = {}
             if hotel.url is not None:
-                google_prices = provider_prices(hotel.url)
-            tripadvisor_key = resolve_tripadvisor(hotel.name, hotel.location)
+                attempted_sources += 1
+                try:
+                    google_prices = _call_google_provider_prices(
+                        provider_prices,
+                        hotel.url,
+                        hotel.checkin.isoformat(),
+                        hotel.checkout.isoformat(),
+                    )
+                except Exception as error:
+                    failure = _provider_failure(error, "google_provider")
+                    provider_errors.append(failure)
+                    provider_warnings.append(
+                        {
+                            "name": hotel.name,
+                            "code": failure.code,
+                            "source": failure.source,
+                        }
+                    )
+            tripadvisor_key = None
+            try:
+                tripadvisor_key = resolve_tripadvisor(
+                    hotel.name, hotel.location
+                )
+            except Exception as error:
+                attempted_sources += 1
+                failure = _provider_failure(error, "xotelo")
+                provider_errors.append(failure)
+                provider_warnings.append(
+                    {
+                        "name": hotel.name,
+                        "code": failure.code,
+                        "source": failure.source,
+                    }
+                )
             xotelo_prices: Mapping[str, object] = {}
             if tripadvisor_key is not None:
-                xotelo_prices = xotelo_prices_callable(
-                    tripadvisor_key,
-                    hotel.name,
-                    hotel.checkin.isoformat(),
-                    hotel.checkout.isoformat(),
+                attempted_sources += 1
+                try:
+                    xotelo_prices = _xotelo_provider_prices(
+                        xotelo_prices_callable(
+                            tripadvisor_key,
+                            hotel.name,
+                            hotel.checkin.isoformat(),
+                            hotel.checkout.isoformat(),
+                        )
+                    )
+                except Exception as error:
+                    failure = _provider_failure(error, "xotelo")
+                    provider_errors.append(failure)
+                    provider_warnings.append(
+                        {
+                            "name": hotel.name,
+                            "code": failure.code,
+                            "source": failure.source,
+                        }
+                    )
+            try:
+                merged_prices = _merge_provider_prices(
+                    google_prices, xotelo_prices
                 )
-            return {
-                **_serialize_hotel_input(hotel),
-                "providers": _merge_provider_prices(google_prices, xotelo_prices),
-                "xotelo_key": tripadvisor_key,
-            }
+            except Exception as error:
+                source = (
+                    error.source
+                    if isinstance(error, UpstreamError)
+                    else "internal"
+                )
+                failure = _provider_failure(error, source)
+                provider_errors.append(failure)
+                provider_warnings.append(
+                    {
+                        "name": hotel.name,
+                        "code": failure.code,
+                        "source": failure.source,
+                    }
+                )
+                merged_prices = {}
+            failed_hotel = None
+            if attempted_sources and len(provider_errors) >= attempted_sources:
+                failure = next(
+                    (
+                        error
+                        for error in provider_errors
+                        if error.code == "timeout"
+                    ),
+                    provider_errors[0],
+                )
+                failed_hotel = {
+                    "name": hotel.name,
+                    "code": failure.code,
+                    "source": failure.source,
+                }
+            return (
+                {
+                    **_serialize_hotel_input(hotel),
+                    "providers": merged_prices,
+                    "xotelo_key": tripadvisor_key,
+                },
+                provider_warnings,
+                failed_hotel,
+            )
 
         successes, failures = run_bounded(
             list(query.hotels), enrich, max_workers=min(4, len(query.hotels))
         )
-        enriched = [value for _hotel, value in successes]
-        for hotel, _error in failures:
+        enriched = [value[0] for _hotel, value in successes]
+        warnings = [
+            warning
+            for _hotel, (_value, hotel_warnings, _failed) in successes
+            for warning in hotel_warnings
+        ]
+        failed_hotels = [
+            failed
+            for _hotel, (_value, _warnings, failed) in successes
+            if failed is not None
+        ]
+        for hotel, error in failures:
             enriched.append(
                 {
                     **_serialize_hotel_input(hotel),
@@ -1162,18 +1671,21 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
                     "xotelo_key": None,
                 }
             )
+            failure = {
+                "name": hotel.name,
+                "code": error.code,
+                "source": error.source,
+            }
+            failed_hotels.append(failure)
+            warnings.append(failure)
         enriched.sort(key=lambda hotel: float(hotel["price"]))
-        failed_hotels = [
-            {"name": hotel.name, "code": error.code, "source": error.source}
-            for hotel, error in failures
-        ]
         return jsonify(
             {
                 "hotels": enriched,
                 "checkin": query.checkin.isoformat(),
                 "checkout": query.checkout.isoformat(),
                 "failedHotels": failed_hotels,
-                "warnings": failed_hotels,
+                "warnings": warnings,
             }
         )
 
@@ -1196,6 +1708,7 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
                 "caches": {
                     "search": services["search_cache"].size(),
                     "providers": services["provider_cache"].size(),
+                    "xotelo": services["xotelo_cache"].size(),
                 },
                 "activeSweep": active.to_dict() if active is not None else None,
                 "runtime": {
@@ -1207,10 +1720,8 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
 
     @application.get("/")
     def serve_index():
-        if application.static_folder and Path(
-            application.static_folder, "index.html"
-        ).is_file():
-            return send_from_directory(application.static_folder, "index.html")
+        if static_dir.joinpath("index.html").is_file():
+            return send_from_directory(str(static_dir), "index.html")
         return "API running. Frontend at http://localhost:5173", 200
 
     @application.get("/<path:path>")
@@ -1219,13 +1730,16 @@ def create_app(test_config: Mapping[str, object] | None = None) -> Flask:
             return _error_response(
                 "not_found", "API route was not found.", {"path": f"/{path}"}, 404
             )
-        if application.static_folder:
-            requested = Path(application.static_folder, path)
-            if requested.is_file():
-                return send_from_directory(application.static_folder, path)
-            index = Path(application.static_folder, "index.html")
-            if index.is_file():
-                return send_from_directory(application.static_folder, "index.html")
+        static_root = static_dir.resolve()
+        requested = static_root.joinpath(path).resolve()
+        try:
+            requested.relative_to(static_root)
+        except ValueError:
+            return "Not found", 404
+        if requested.is_file():
+            return send_from_directory(str(static_root), path)
+        if static_root.joinpath("index.html").is_file():
+            return send_from_directory(str(static_root), "index.html")
         return "Not found", 404
 
     return application

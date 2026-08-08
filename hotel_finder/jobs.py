@@ -122,16 +122,22 @@ class SweepJob:
         if not isinstance(frozen, Mapping):
             raise TypeError("progress must be a JSON object")
         with self._lock:
+            if self.cancel_requested:
+                return
             self.progress = dict(frozen)
 
     def add_partial(self, value: object) -> None:
         frozen = _freeze_json(value)
         with self._lock:
+            if self.cancel_requested:
+                return
             self.partial.append(frozen)
 
     def add_warning(self, value: object) -> None:
         frozen = _freeze_json(value)
         with self._lock:
+            if self.cancel_requested:
+                return
             self.warnings.append(frozen)
 
     def snapshot(self) -> SweepJobSnapshot:
@@ -158,7 +164,8 @@ class SweepJob:
             )
 
     def _request_cancel(self) -> None:
-        self._cancel_event.set()
+        with self._lock:
+            self._cancel_event.set()
 
     def _mark_running(self, now: float) -> bool:
         with self._lock:
@@ -195,9 +202,18 @@ class SweepJob:
                 self.result = None
             else:
                 self.status = "failed"
-                self.error = _FrozenJSONDict(
-                    {"message": str(exc), "type": type(exc).__name__}
-                )
+                error: dict[str, object] = {
+                    "message": str(exc),
+                    "type": type(exc).__name__,
+                }
+                for attribute in ("code", "source", "retryable"):
+                    value = getattr(exc, attribute, None)
+                    if value is not None:
+                        error[attribute] = value
+                frozen_error = _freeze_json(error)
+                if not isinstance(frozen_error, _FrozenJSONDict):
+                    raise TypeError("error must be a JSON object")
+                self.error = frozen_error
             self.finished_at = now
 
 

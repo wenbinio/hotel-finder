@@ -29,6 +29,19 @@ def test_hotel_card_extracts_star_price_and_metadata():
     ]
 
 
+def test_hotel_card_sanitizes_nonfinite_review_rating():
+    html = """<div class="uaTTDe"><h2 class="BgYkof">Test Grand Hotel</h2>
+    <span class="KFi5wf lA0BZ">NaN</span><span class="ne5qie Ih19Ad">5-star hotel</span>
+    <span>$220</span></div>"""
+
+    hotels = parse_hotel_cards(
+        html,
+        ParseContext("Bangkok", "2026-08-09", "2026-08-10", 5, "non_beachfront", 126),
+    )
+
+    assert hotels[0]["rating"] is None
+
+
 def test_hotel_parser_falls_back_to_known_amenities_and_discards_high_prices():
     html = """
     <div class="uaTTDe"><h2 class="Cx32Ud">The Westin Bangkok</h2>

@@ -372,7 +372,11 @@ def _amenities(payload: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _hotel_input(
-    payload: Any, index: int, known_locations: set[str], checkin: date, checkout: date, today: date
+    payload: Any,
+    index: int,
+    known_locations: set[str],
+    checkin: date,
+    checkout: date,
 ) -> HotelInput:
     if not isinstance(payload, Mapping):
         raise _problem(f"hotels[{index}]", "must be an object")
@@ -388,8 +392,6 @@ def _hotel_input(
         if url is not None:
             url = validate_google_hotel_url(url)
         hotel_checkin, hotel_checkout = checkin, checkout
-        if "checkin" in payload or "checkout" in payload:
-            hotel_checkin, hotel_checkout = _stay_dates(payload, "checkin", "checkout", today)
         price = _required_number(payload, "price", 0.01, 1500)
         rating = (
             None
@@ -439,7 +441,7 @@ def parse_compare_request(
     if len(hotels_value) > MAX_COMPARE_HOTELS:
         raise _problem("hotels", f"must contain at most {MAX_COMPARE_HOTELS} hotels")
     hotels = tuple(
-        _hotel_input(hotel, index, known_locations, checkin, checkout, current_day)
+        _hotel_input(hotel, index, known_locations, checkin, checkout)
         for index, hotel in enumerate(hotels_value)
     )
     return CompareRequest(hotels, checkin, checkout)

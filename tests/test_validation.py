@@ -252,6 +252,23 @@ def test_compare_round_trips_safe_display_metadata():
     assert request.hotels[0].flight_cost == 126.0
 
 
+def test_compare_top_level_dates_are_authoritative_over_stale_hotel_metadata():
+    request = parse_compare_request(
+        {
+            "checkin": "2026-08-09",
+            "checkout": "2026-08-14",
+            "hotels": [
+                hotel_payload(checkin="2026-09-01", checkout="2026-09-02")
+            ],
+        },
+        KNOWN_LOCATIONS,
+        today=TODAY,
+    )
+
+    assert request.hotels[0].checkin == date(2026, 8, 9)
+    assert request.hotels[0].checkout == date(2026, 8, 14)
+
+
 @pytest.mark.parametrize(
     ("overrides", "field"),
     [

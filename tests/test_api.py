@@ -167,6 +167,63 @@ def test_search_all_filters_requested_destinations_by_flight_budget(app_factory)
     assert calls == ["Bangkok"]
 
 
+def test_search_all_empty_success_plus_timeout_is_not_reported_as_empty_inventory(
+    app_factory,
+):
+    def fake_search(location, *_args, **_kwargs):
+        if location == "Phuket":
+            raise UpstreamError("timeout", source="google", retryable=True)
+        return []
+
+    application = app_factory(SEARCH_HOTELS=fake_search)
+    response = application.test_client().post(
+        "/api/search-all",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-11",
+            "destinations": ["Bangkok", "Phuket"],
+        },
+    )
+
+    assert response.status_code == 504
+    assert response.json["error"]["code"] == "timeout"
+
+
+def test_search_all_all_genuine_empty_is_a_success(app_factory):
+    application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
+    response = application.test_client().post(
+        "/api/search-all",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-11",
+            "destinations": ["Bangkok", "Phuket"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json["totalBeachfront"] == 0
+    assert response.json["totalNonBeachfront"] == 0
+    assert response.json["failedDestinations"] == []
+
+
+def test_search_all_all_timeouts_returns_gateway_timeout(app_factory):
+    def timeout(*_args, **_kwargs):
+        raise UpstreamError("timeout", source="google", retryable=True)
+
+    application = app_factory(SEARCH_HOTELS=timeout)
+    response = application.test_client().post(
+        "/api/search-all",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-11",
+            "destinations": ["Bangkok", "Phuket"],
+        },
+    )
+
+    assert response.status_code == 504
+    assert response.json["error"]["code"] == "timeout"
+
+
 def test_compare_requires_top_level_dates_and_preserves_validated_metadata(app_factory):
     application = app_factory(
         PROVIDER_PRICES=lambda *_args, **_kwargs: {"agoda": 90.0},
@@ -228,6 +285,135 @@ def test_compare_isolates_one_failed_future_and_keeps_input_hotel(app_factory):
     assert response.json["failedHotels"] == [
         {"name": "Broken", "code": "timeout", "source": "google_provider"}
     ]
+
+
+def test_compare_isolates_google_and_xotelo_failures_within_each_hotel(app_factory):
+    def google_prices(url):
+        if url.endswith("/xotelo-only"):
+            raise UpstreamError(
+                "timeout", source="google_provider", retryable=True
+            )
+        return {"booking.com": 91.0}
+
+    def xotelo_prices(_key, hotel_name, *_dates):
+        if hotel_name == "Google Only":
+            raise UpstreamError("timeout", source="xotelo", retryable=True)
+        return {"Agoda": {"rate": 88.0, "tax": 0, "url": "https://agoda.test"}}
+
+    application = app_factory(
+        PROVIDER_PRICES=google_prices,
+        XOTELO_PRICES=xotelo_prices,
+        RESOLVE_TRIPADVISOR=lambda *_args: "ta-key",
+    )
+    hotels = [
+        {
+            **VALID_HOTEL,
+            "name": "Google Only",
+            "url": VALID_HOTEL["url"] + "/google-only",
+        },
+        {
+            **VALID_HOTEL,
+            "name": "Xotelo Only",
+            "url": VALID_HOTEL["url"] + "/xotelo-only",
+        },
+    ]
+
+    response = application.test_client().post(
+        "/api/compare-prices",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-14",
+            "hotels": hotels,
+        },
+    )
+
+    assert response.status_code == 200
+    by_name = {hotel["name"]: hotel for hotel in response.json["hotels"]}
+    assert by_name["Google Only"]["providers"] == {
+        "booking.com": {"rate": 91.0, "url": ""}
+    }
+    assert by_name["Xotelo Only"]["providers"] == {
+        "agoda": {"rate": 88.0, "url": "https://agoda.test"}
+    }
+    assert response.json["warnings"] == [
+        {"name": "Google Only", "code": "timeout", "source": "xotelo"},
+        {
+            "name": "Xotelo Only",
+            "code": "timeout",
+            "source": "google_provider",
+        },
+    ]
+
+
+def test_compare_preserves_google_rates_when_xotelo_key_lookup_fails(app_factory):
+    def fail_lookup(*_args):
+        raise RuntimeError("lookup unavailable")
+
+    application = app_factory(
+        PROVIDER_PRICES=lambda _url: {"booking.com": 91.0},
+        RESOLVE_TRIPADVISOR=fail_lookup,
+    )
+
+    response = application.test_client().post(
+        "/api/compare-prices",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-14",
+            "hotels": [VALID_HOTEL],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json["hotels"][0]["providers"] == {
+        "booking.com": {"rate": 91.0, "url": ""}
+    }
+    assert response.json["failedHotels"] == []
+    assert response.json["warnings"] == [
+        {
+            "name": "Bangkok Test",
+            "code": "upstream_failure",
+            "source": "xotelo",
+        }
+    ]
+
+
+def test_compare_top_level_dates_override_stale_hotel_dates(app_factory):
+    google_calls = []
+    xotelo_calls = []
+
+    def google_prices(_url, *, checkin, checkout):
+        google_calls.append((checkin, checkout))
+        return {}
+
+    def xotelo_prices(_key, _name, checkin, checkout):
+        xotelo_calls.append((checkin, checkout))
+        return {}
+
+    application = app_factory(
+        PROVIDER_PRICES=google_prices,
+        XOTELO_PRICES=xotelo_prices,
+        RESOLVE_TRIPADVISOR=lambda *_args: "ta-key",
+    )
+    stale = {
+        **VALID_HOTEL,
+        "checkin": "2026-09-01",
+        "checkout": "2026-09-02",
+    }
+
+    response = application.test_client().post(
+        "/api/compare-prices",
+        json={
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-14",
+            "hotels": [stale],
+        },
+    )
+
+    assert response.status_code == 200
+    assert google_calls == [("2026-08-10", "2026-08-14")]
+    assert xotelo_calls == [("2026-08-10", "2026-08-14")]
+    assert response.json["hotels"][0]["checkin"] == "2026-08-10"
+    assert response.json["hotels"][0]["checkout"] == "2026-08-14"
 
 
 def test_compare_rejects_unsupported_google_url_before_provider_call(app_factory):
@@ -316,7 +502,7 @@ def test_health_uses_cache_and_job_public_snapshots(app_factory):
             "totalTimeoutSeconds": 15,
             "followRedirects": False,
         },
-        "caches": {"search": 0, "providers": 0},
+        "caches": {"search": 0, "providers": 0, "xotelo": 0},
         "activeSweep": None,
         "runtime": {"workers": 1, "upstreamConcurrency": 4},
     }
@@ -342,6 +528,47 @@ def test_upstream_error_handler_uses_504_for_timeouts(app_factory):
         "message": "The google request timed out.",
         "fields": {"retryable": True, "source": "google"},
     }
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_search_never_serializes_nonfinite_upstream_numbers(app_factory, nonfinite):
+    application = app_factory(
+        SEARCH_HOTELS=lambda *_args, **_kwargs: [
+            {**VALID_HOTEL, "rating": nonfinite}
+        ]
+    )
+
+    response = application.test_client().post(
+        "/api/search",
+        json={
+            "location": "Bangkok",
+            "checkin": "2026-08-10",
+            "checkout": "2026-08-11",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json["error"]["code"] == "unexpected_content"
+    assert b"NaN" not in response.data
+    assert b"Infinity" not in response.data
+
+
+def test_spa_and_unknown_api_routes_are_not_shadowed_by_flask_static(app_factory):
+    application = app_factory(SEARCH_HOTELS=lambda *_args, **_kwargs: [])
+    client = application.test_client()
+
+    spa = client.get("/saved-searches/private")
+    missing = client.get("/api/nope")
+    wrong_method = client.post("/api/destinations")
+
+    assert spa.status_code == 200
+    assert b'<div id="root"></div>' in spa.data
+    assert missing.status_code == 404
+    assert missing.is_json
+    assert missing.json["error"]["code"] == "not_found"
+    assert wrong_method.status_code == 405
+    assert wrong_method.is_json
+    assert wrong_method.json["error"]["code"] == "method_not_allowed"
 
 
 def test_run_bounded_preserves_input_order_and_reports_upstream_failures():

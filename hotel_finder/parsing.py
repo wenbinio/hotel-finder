@@ -1,5 +1,6 @@
 """Pure parsers for Google Hotels response markup."""
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -139,9 +140,10 @@ def _parse_rating(card: Any) -> float | None:
     if rating_node is None:
         return None
     try:
-        return float(rating_node.text(strip=True))
+        rating = float(rating_node.text(strip=True))
     except ValueError:
         return None
+    return rating if math.isfinite(rating) and 0 <= rating <= 5 else None
 
 
 def _html_star_class(card: Any) -> int | None:
