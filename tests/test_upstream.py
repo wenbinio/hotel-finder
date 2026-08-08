@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date
 
 import pytest
 import requests
 
 import app as app_module
+import hotel_finder.cache as cache_module
 from app import (
     UpstreamError,
     call_with_retry,
@@ -18,7 +19,7 @@ from app import (
     fetch_xotelo_prices,
     search_hotels,
 )
-from hotel_finder.cache import TTLCache
+from hotel_finder.cache import CacheDeadlineExceeded, TTLCache
 
 HOTEL_HTML = """
 <html><body><div class="uaTTDe">
@@ -167,32 +168,38 @@ class FakeClock:
         self.now += seconds
 
 
-class PublicationDelayCache(TTLCache):
-    def __init__(self, clock):
-        super().__init__(max_entries=8, ttl_seconds=900, clock=clock)
+class AdvanceOnCacheSampleClock:
+    def __init__(self, clock, *, advance_on_call, seconds):
         self.clock = clock
-        self.delay_next_publication = True
+        self.advance_on_call = advance_on_call
+        self.seconds = seconds
+        self.calls = 0
+        self.lock = threading.Lock()
 
-    def get_or_load(
-        self, key, loader, ttl_seconds=None, *, before_store=None
-    ):
-        def delayed_loader():
-            value = loader()
-            if self.delay_next_publication:
-                self.delay_next_publication = False
-                self.clock.advance(16)
-            return value
+    def __call__(self):
+        with self.lock:
+            self.calls += 1
+            if self.calls == self.advance_on_call:
+                self.clock.advance(self.seconds)
+            return self.clock()
 
-        if before_store is None:
-            return super().get_or_load(
-                key, delayed_loader, ttl_seconds=ttl_seconds
-            )
-        return super().get_or_load(
-            key,
-            delayed_loader,
-            ttl_seconds=ttl_seconds,
-            before_store=before_store,
-        )
+
+class BlockingSequenceClient(SequenceClient):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.blocked = False
+
+    def get(self, url, **kwargs):
+        with self.lock:
+            should_block = not self.blocked
+            self.blocked = True
+        if should_block:
+            self.started.set()
+            assert self.release.wait(2)
+        return super().get(url, **kwargs)
 
 
 class DeterministicRng:
@@ -876,10 +883,21 @@ def test_xotelo_recursion_error_is_malformed_content(app_factory, monkeypatch):
 
 
 def test_xotelo_publication_crossing_deadline_is_not_returned_or_cached(
-    app_factory,
+    app_factory, monkeypatch
 ):
-    clock = FakeClock()
-    cache = PublicationDelayCache(clock)
+    waiter_joined = threading.Event()
+
+    class WaiterAwareFuture(Future):
+        def result(self, timeout=None):
+            waiter_joined.set()
+            return super().result(timeout=timeout)
+
+    monkeypatch.setattr(cache_module, "Future", WaiterAwareFuture)
+    service_clock = FakeClock()
+    cache_clock = AdvanceOnCacheSampleClock(
+        service_clock, advance_on_call=5, seconds=16
+    )
+    cache = TTLCache(max_entries=8, ttl_seconds=900, clock=cache_clock)
     expired = JsonResponse({"result": {"rates": []}})
     valid = JsonResponse(
         {
@@ -894,24 +912,88 @@ def test_xotelo_publication_crossing_deadline_is_not_returned_or_cached(
             }
         }
     )
-    client = SequenceClient([expired, valid])
+    client = BlockingSequenceClient([expired, valid])
     application = app_factory(
-        CLOCK=clock, XOTELO_CACHE=cache, XOTELO_CLIENT=client
+        CLOCK=service_clock, XOTELO_CACHE=cache, XOTELO_CLIENT=client
     )
 
+    def capture_timeout():
+        with application.app_context():
+            try:
+                fetch_xotelo_prices(
+                    "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+                )
+            except UpstreamError as error:
+                return error
+        raise AssertionError("late Xotelo result was returned")
+
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        owner = pool.submit(capture_timeout)
+        assert client.started.wait(1)
+        waiter = pool.submit(capture_timeout)
+        assert waiter_joined.wait(1)
+        client.release.set()
+        errors = [owner.result(timeout=2), waiter.result(timeout=2)]
+    finally:
+        client.release.set()
+        pool.shutdown(wait=True)
+
+    assert [error.code for error in errors] == ["timeout", "timeout"]
+    assert all(error.retryable for error in errors)
+    assert isinstance(errors[0].__cause__, CacheDeadlineExceeded)
+    assert errors[0].__cause__ is errors[1].__cause__
+    assert cache.size() == 0
+
     with application.app_context():
-        with pytest.raises(UpstreamError) as caught:
-            fetch_xotelo_prices(
-                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
-            )
-        assert cache.size() == 0
         recovered = fetch_xotelo_prices(
             "ta-key", "Hotel", "2026-08-10", "2026-08-11"
         )
 
-    assert caught.value.code == "timeout"
     assert recovered["Agoda"]["rate"] == 88.0
     assert len(client.calls) == 2
+    assert expired.closed is True
+
+
+def test_xotelo_publication_deadline_uses_injected_cache_clock_epoch(
+    app_factory,
+):
+    service_clock = FakeClock()
+    cache_clock = FakeClock()
+    cache_clock.advance(57_000)
+    cache = TTLCache(max_entries=8, ttl_seconds=900, clock=cache_clock)
+    client = SequenceClient(
+        [
+            JsonResponse(
+                {
+                    "result": {
+                        "rates": [
+                            {
+                                "name": "Agoda",
+                                "code": "Agoda",
+                                "rate": 88.0,
+                            }
+                        ]
+                    }
+                }
+            )
+        ]
+    )
+    application = app_factory(
+        CLOCK=service_clock, XOTELO_CACHE=cache, XOTELO_CLIENT=client
+    )
+
+    with application.app_context():
+        first = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+        cached = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert first["Agoda"]["rate"] == 88.0
+    assert cached == first
+    assert len(client.calls) == 1
 
 
 def test_xotelo_header_wait_obeys_hard_deadline_without_releasing_live_slot(

@@ -12,6 +12,15 @@ class CacheResult[V]:
     hit: bool
 
 
+class CacheDeadlineExceeded(RuntimeError):
+    """Raised when a loaded value reaches cache publication too late."""
+
+    def __init__(self, *, not_after: float, observed_at: float) -> None:
+        super().__init__("cache publication deadline exceeded")
+        self.not_after = not_after
+        self.observed_at = observed_at
+
+
 @dataclass(slots=True)
 class _Entry[V]:
     value: V
@@ -51,14 +60,24 @@ class TTLCache[K: Hashable, V]:
         with self._lock:
             self._set_locked(key, value, ttl, self._clock())
 
+    def deadline_after(self, seconds: float) -> float:
+        """Return an absolute deadline in this cache's clock domain."""
+        self._ensure_valid_ttl(seconds)
+        return self._clock() + seconds
+
     def get_or_load(
         self,
         key: K,
         loader: Callable[[], V],
         ttl_seconds: float | None = None,
         *,
-        before_store: Callable[[], None] | None = None,
+        not_after: float | None = None,
     ) -> CacheResult[V]:
+        """Load once and publish unless sampled strictly after ``not_after``.
+
+        Equality is on time. The publication clock is sampled exactly once
+        while holding the cache lock and that same value anchors TTL expiry.
+        """
         ttl = self._validated_ttl(ttl_seconds)
 
         while True:
@@ -83,9 +102,12 @@ class TTLCache[K: Hashable, V]:
             try:
                 value = loader()
                 with self._lock:
-                    if before_store is not None:
-                        before_store()
-                    self._set_locked(key, value, ttl, self._clock())
+                    now = self._clock()
+                    if not_after is not None and now > not_after:
+                        raise CacheDeadlineExceeded(
+                            not_after=not_after, observed_at=now
+                        )
+                    self._set_locked(key, value, ttl, now)
             except BaseException as exc:
                 with self._lock:
                     if self._inflight.get(key) is flight:

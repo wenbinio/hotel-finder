@@ -36,7 +36,7 @@ from werkzeug.exceptions import (
 )
 
 from hotel_finder import __version__
-from hotel_finder.cache import TTLCache
+from hotel_finder.cache import CacheDeadlineExceeded, TTLCache
 from hotel_finder.jobs import JobConflict, JobNotFound, SweepJob, SweepJobManager
 from hotel_finder.parsing import (
     ParseContext,
@@ -1166,12 +1166,11 @@ def fetch_xotelo_prices(
     services = _runtime_services(runtime)
     cache = services["xotelo_cache"]
     key = (hotel_key, checkin, checkout, currency, "xotelo")
-    publication_deadline: float | None = None
+    transport_deadline = services["clock"]() + TOTAL_TIMEOUT_SECONDS
+    publication_deadline = cache.deadline_after(TOTAL_TIMEOUT_SECONDS)
 
     def load() -> tuple[tuple[str, str, float, float], ...]:
-        nonlocal publication_deadline
-        deadline = services["clock"]() + TOTAL_TIMEOUT_SECONDS
-        publication_deadline = deadline
+        deadline = transport_deadline
         xotelo_semaphore = _acquire_semaphore(
             services["xotelo_semaphore"],
             services,
@@ -1245,21 +1244,17 @@ def fetch_xotelo_prices(
         )
         return frozen_rates
 
-    def check_publication_deadline() -> None:
-        if publication_deadline is None:
-            raise UpstreamError(
-                "unexpected_content", source="xotelo", retryable=False
-            )
-        _raise_if_upstream_aborted(
-            services, source="xotelo", deadline=publication_deadline
+    try:
+        loaded = cache.get_or_load(
+            key,
+            load,
+            ttl_seconds=XOTELO_CACHE_SECONDS,
+            not_after=publication_deadline,
         )
-
-    loaded = cache.get_or_load(
-        key,
-        load,
-        ttl_seconds=XOTELO_CACHE_SECONDS,
-        before_store=check_publication_deadline,
-    )
+    except CacheDeadlineExceeded as error:
+        raise UpstreamError(
+            "timeout", source="xotelo", retryable=True
+        ) from error
     return {
         name: {
             "rate": rate,

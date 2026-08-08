@@ -5,7 +5,7 @@ from threading import Barrier, Event, Lock, Thread
 import pytest
 
 import hotel_finder.cache as cache_module
-from hotel_finder.cache import CacheResult, TTLCache
+from hotel_finder.cache import CacheDeadlineExceeded, CacheResult, TTLCache
 
 
 class FakeClock:
@@ -17,6 +17,16 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class SequenceClock:
+    def __init__(self, values: list[float]) -> None:
+        self.values = iter(values)
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return next(self.values)
 
 
 def test_get_or_load_coalesces_same_key() -> None:
@@ -43,26 +53,71 @@ def test_get_or_load_coalesces_same_key() -> None:
     assert sum(not result.hit for result in results) == 1
 
 
-def test_get_or_load_before_store_can_abort_publication() -> None:
-    cache = TTLCache(max_entries=8, ttl_seconds=60)
-    events = []
+def test_get_or_load_not_after_allows_boundary_with_one_publication_sample() -> None:
+    clock = SequenceClock([0.0, 10.0, 11.0])
+    cache = TTLCache(max_entries=8, ttl_seconds=60, clock=clock)
 
-    def loader() -> str:
-        events.append("loaded")
+    loaded = cache.get_or_load("same", lambda: "on-time", not_after=10.0)
+
+    assert loaded == CacheResult(value="on-time", hit=False)
+    assert clock.calls == 2
+    assert cache.get("same") == CacheResult(value="on-time", hit=True)
+
+
+def test_deadline_after_uses_the_cache_clock_domain() -> None:
+    clock = FakeClock()
+    clock.advance(57_000)
+    cache = TTLCache(max_entries=8, ttl_seconds=60, clock=clock)
+
+    assert cache.deadline_after(15) == 57_015
+
+
+def test_get_or_load_deadline_failure_is_shared_then_retryable(monkeypatch) -> None:
+    waiter_joined = Event()
+
+    class WaiterAwareFuture(Future):
+        def result(self, timeout=None):
+            waiter_joined.set()
+            return super().result(timeout=timeout)
+
+    monkeypatch.setattr(cache_module, "Future", WaiterAwareFuture)
+    clock = FakeClock()
+    cache = TTLCache(max_entries=8, ttl_seconds=60, clock=clock)
+    owner_started = Event()
+    release_owner = Event()
+    calls = 0
+
+    def late_loader() -> str:
+        nonlocal calls
+        calls += 1
+        owner_started.set()
+        assert release_owner.wait(2)
         return "late"
 
-    def reject_store() -> None:
-        events.append("checked")
-        raise RuntimeError("deadline crossed")
+    def capture_deadline() -> CacheDeadlineExceeded:
+        try:
+            cache.get_or_load("same", late_loader, not_after=0.0)
+        except CacheDeadlineExceeded as error:
+            return error
+        raise AssertionError("late cache publication succeeded")
 
-    with pytest.raises(RuntimeError, match="deadline crossed"):
-        cache.get_or_load("same", loader, before_store=reject_store)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(capture_deadline)
+        assert owner_started.wait(1)
+        waiter = pool.submit(capture_deadline)
+        assert waiter_joined.wait(1)
+        clock.advance(1)
+        release_owner.set()
+        errors = [owner.result(timeout=2), waiter.result(timeout=2)]
 
-    assert events == ["loaded", "checked"]
+    assert calls == 1
+    assert errors[0] is errors[1]
+    assert errors[0].not_after == 0.0
+    assert errors[0].observed_at == 1.0
     assert cache.get("same") is None
-    assert cache.get_or_load("same", lambda: "recovered") == CacheResult(
-        value="recovered", hit=False
-    )
+    assert cache.get_or_load(
+        "same", lambda: "recovered", not_after=1.0
+    ) == CacheResult(value="recovered", hit=False)
 
 
 def test_persistent_failure_is_shared_once_by_the_waiting_cohort_then_retryable() -> None:
