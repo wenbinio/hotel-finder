@@ -184,6 +184,56 @@ class AdvanceOnCacheSampleClock:
             return self.clock()
 
 
+class TrackingClock:
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = 0
+        self.values = []
+        self.lock = threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            self.calls += 1
+            value = self.clock()
+            self.values.append(value)
+            return value
+
+    def was_sampled(self):
+        with self.lock:
+            return self.calls > 0
+
+
+class PreemptingPublicationClock:
+    def __init__(self, clock, service_clock, publication_ready):
+        self.clock = clock
+        self.service_clock = service_clock
+        self.publication_ready = publication_ready
+        self.anchor_sampled = False
+        self.publication_advanced = False
+        self.anchor_value = None
+        self.publication_value = None
+        self.lock = threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            if not self.anchor_sampled:
+                self.anchor_sampled = True
+                if self.service_clock.was_sampled():
+                    self._advance_to(10)
+                self.anchor_value = self.clock()
+                return self.anchor_value
+            elif self.publication_ready.is_set() and not self.publication_advanced:
+                self.publication_advanced = True
+                self._advance_to(16)
+                self.publication_value = self.clock()
+                return self.publication_value
+            return self.clock()
+
+    def _advance_to(self, target):
+        if self.clock.now < target:
+            self.clock.advance(target - self.clock.now)
+
+
 class BlockingSequenceClient(SequenceClient):
     def __init__(self, responses):
         super().__init__(responses)
@@ -199,6 +249,20 @@ class BlockingSequenceClient(SequenceClient):
         if should_block:
             self.started.set()
             assert self.release.wait(2)
+        return super().get(url, **kwargs)
+
+
+class AdvancingSequenceClient(SequenceClient):
+    def __init__(self, responses, clock, publication_ready):
+        super().__init__(responses)
+        self.clock = clock
+        self.publication_ready = publication_ready
+
+    def get(self, url, **kwargs):
+        if not self.publication_ready.is_set():
+            if self.clock.now < 10:
+                self.clock.advance(10 - self.clock.now)
+            self.publication_ready.set()
         return super().get(url, **kwargs)
 
 
@@ -994,6 +1058,58 @@ def test_xotelo_publication_deadline_uses_injected_cache_clock_epoch(
     assert first["Agoda"]["rate"] == 88.0
     assert cached == first
     assert len(client.calls) == 1
+
+
+def test_xotelo_anchors_cache_deadline_before_transport_preemption(
+    app_factory,
+):
+    base_clock = FakeClock()
+    service_clock = TrackingClock(base_clock)
+    publication_ready = threading.Event()
+    cache_clock = PreemptingPublicationClock(
+        base_clock, service_clock, publication_ready
+    )
+    cache = TTLCache(max_entries=8, ttl_seconds=900, clock=cache_clock)
+    expired = JsonResponse({"result": {"rates": []}})
+    valid = JsonResponse(
+        {
+            "result": {
+                "rates": [
+                    {
+                        "name": "Agoda",
+                        "code": "Agoda",
+                        "rate": 88.0,
+                    }
+                ]
+            }
+        }
+    )
+    client = AdvancingSequenceClient(
+        [expired, valid], base_clock, publication_ready
+    )
+    application = app_factory(
+        CLOCK=service_clock, XOTELO_CACHE=cache, XOTELO_CLIENT=client
+    )
+
+    with application.app_context():
+        with pytest.raises(UpstreamError) as caught:
+            fetch_xotelo_prices(
+                "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+            )
+        last_loader_time = service_clock.values[-1]
+        assert cache.size() == 0
+        recovered = fetch_xotelo_prices(
+            "ta-key", "Hotel", "2026-08-10", "2026-08-11"
+        )
+
+    assert caught.value.code == "timeout"
+    assert caught.value.retryable is True
+    assert cache_clock.anchor_value == 0.0
+    assert cache_clock.publication_value == 16.0
+    assert last_loader_time == 10.0
+    assert recovered["Agoda"]["rate"] == 88.0
+    assert len(client.calls) == 2
+    assert expired.closed is True
 
 
 def test_xotelo_header_wait_obeys_hard_deadline_without_releasing_live_slot(

@@ -1166,8 +1166,8 @@ def fetch_xotelo_prices(
     services = _runtime_services(runtime)
     cache = services["xotelo_cache"]
     key = (hotel_key, checkin, checkout, currency, "xotelo")
-    transport_deadline = services["clock"]() + TOTAL_TIMEOUT_SECONDS
     publication_deadline = cache.deadline_after(TOTAL_TIMEOUT_SECONDS)
+    transport_deadline = services["clock"]() + TOTAL_TIMEOUT_SECONDS
 
     def load() -> tuple[tuple[str, str, float, float], ...]:
         deadline = transport_deadline
