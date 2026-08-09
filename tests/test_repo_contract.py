@@ -26,6 +26,14 @@ def test_node_runtime_is_pinned_consistently():
     assert lock["packages"][""]["engines"]["node"] == node_version
 
 
+def test_frontend_and_generated_text_use_lf_on_every_platform():
+    attributes = (ROOT / ".gitattributes").read_text("utf-8").splitlines()
+
+    assert "frontend/** text=auto eol=lf" in attributes
+    assert "static/** text=auto eol=lf" in attributes
+    assert "*.png binary" in attributes
+
+
 def test_static_verifier_exists():
     assert (ROOT / "scripts" / "verify_static.py").is_file()
 
