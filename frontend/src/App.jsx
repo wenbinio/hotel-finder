@@ -10,6 +10,8 @@ import { cancelSweep, createSweep, fetchJson, getSweep } from './lib/api'
 import { stableHotelKey } from './lib/pricing'
 
 const POLL_DELAY_MS = 750
+const POLL_RETRY_BASE_MS = 1_000
+const POLL_RETRY_MAX_MS = 8_000
 const ACTIVE_SWEEP_STATUSES = new Set(['queued', 'running'])
 const TERMINAL_SWEEP_STATUSES = new Set(['cancelled', 'completed', 'failed'])
 
@@ -197,6 +199,7 @@ export default function App() {
   const pollTimer = useRef(null)
   const sweepInput = useRef(null)
   const pollSweepRef = useRef(null)
+  const pollFailures = useRef({ jobId: null, count: 0 })
   const cancellationInFlight = useRef(null)
   const cancellationObserved = useRef(null)
   const pollRetryAfterCancellation = useRef(null)
@@ -259,19 +262,32 @@ export default function App() {
     setSortKey('price')
   }, [])
 
-  const scheduleSweepPoll = useCallback((jobId, request) => {
+  const resetPollFailures = useCallback(jobId => {
+    pollFailures.current = { jobId: jobId || null, count: 0 }
+  }, [])
+
+  const nextPollRetryDelay = useCallback(jobId => {
+    const previousCount = pollFailures.current.jobId === jobId
+      ? pollFailures.current.count
+      : 0
+    const count = previousCount + 1
+    pollFailures.current = { jobId, count }
+    return Math.min(POLL_RETRY_BASE_MS * (2 ** (count - 1)), POLL_RETRY_MAX_MS)
+  }, [])
+
+  const scheduleSweepPoll = useCallback((jobId, request, delay = POLL_DELAY_MS) => {
     clearPollTimer()
     pollTimer.current = setTimeout(() => {
       pollTimer.current = null
       pollSweepRef.current?.(jobId, request)
-    }, POLL_DELAY_MS)
+    }, delay)
   }, [clearPollTimer])
 
   const resumePollAfterCancellation = useCallback(jobId => {
     const pending = pollRetryAfterCancellation.current
     if (!pending || pending.jobId !== jobId) return
     pollRetryAfterCancellation.current = null
-    if (pending.request.isCurrent()) scheduleSweepPoll(jobId, pending.request)
+    if (pending.request.isCurrent()) scheduleSweepPoll(jobId, pending.request, pending.delay)
   }, [scheduleSweepPoll])
 
   const finishTerminalSweep = useCallback(snapshot => {
@@ -279,6 +295,7 @@ export default function App() {
     cancellationInFlight.current = null
     cancellationObserved.current = null
     pollRetryAfterCancellation.current = null
+    resetPollFailures(null)
     abortCurrent(beginSweep)
     abortCurrent(beginCancellation)
     setSweepJob(previous => applySweepSnapshot(previous, snapshot))
@@ -294,12 +311,13 @@ export default function App() {
         message: sweepFailureMessage(snapshot),
       })
     }
-  }, [applySweepResult, beginCancellation, beginSweep, clearPollTimer])
+  }, [applySweepResult, beginCancellation, beginSweep, clearPollTimer, resetPollFailures])
 
   const pollSweep = useCallback(async (jobId, request) => {
     try {
       const snapshot = await getSweep(jobId, request.signal)
       if (!request.isCurrent()) return
+      resetPollFailures(jobId)
 
       if (ACTIVE_SWEEP_STATUSES.has(snapshot.status)) {
         if (snapshot.cancelRequested) cancellationObserved.current = jobId
@@ -313,21 +331,15 @@ export default function App() {
       else request.finish()
     } catch (pollError) {
       if (!request.isCurrent() || isAbort(pollError)) return
+      const retryDelay = nextPollRetryDelay(jobId)
+      setError({ operation: 'Date sweep polling', message: messageFor(pollError) })
       if (cancellationInFlight.current === jobId) {
-        pollRetryAfterCancellation.current = { jobId, request }
-        setError({ operation: 'Date sweep polling', message: messageFor(pollError) })
+        pollRetryAfterCancellation.current = { jobId, request, delay: POLL_DELAY_MS }
         return
       }
-      if (cancellationObserved.current === jobId) {
-        setError({ operation: 'Date sweep polling', message: messageFor(pollError) })
-        scheduleSweepPoll(jobId, request)
-        return
-      }
-      setSweepJob(previous => previous ? { ...previous, status: 'failed' } : null)
-      setError({ operation: 'Date sweep', message: messageFor(pollError) })
-      request.finish()
+      scheduleSweepPoll(jobId, request, retryDelay)
     }
-  }, [finishTerminalSweep, scheduleSweepPoll])
+  }, [finishTerminalSweep, nextPollRetryDelay, resetPollFailures, scheduleSweepPoll])
 
   useEffect(() => {
     pollSweepRef.current = pollSweep
@@ -340,8 +352,9 @@ export default function App() {
     cancellationInFlight.current = null
     cancellationObserved.current = null
     pollRetryAfterCancellation.current = null
+    resetPollFailures(null)
     setSweepJob(null)
-  }, [beginCancellation, beginSweep, clearPollTimer])
+  }, [beginCancellation, beginSweep, clearPollTimer, resetPollFailures])
 
   const handleSearch = useCallback(async searchQuery => {
     stopSweep()
@@ -420,6 +433,7 @@ export default function App() {
     cancellationInFlight.current = null
     cancellationObserved.current = null
     pollRetryAfterCancellation.current = null
+    resetPollFailures(null)
     setSearching(false)
     setComparing(false)
 
@@ -445,7 +459,15 @@ export default function App() {
       setError({ operation: 'Date sweep', message: messageFor(sweepError) })
       request.finish()
     }
-  }, [beginCancellation, beginComparison, beginSearch, beginSweep, clearPollTimer, pollSweep])
+  }, [
+    beginCancellation,
+    beginComparison,
+    beginSearch,
+    beginSweep,
+    clearPollTimer,
+    pollSweep,
+    resetPollFailures,
+  ])
 
   const handleCancel = useCallback(async jobId => {
     if (

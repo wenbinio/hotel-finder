@@ -932,17 +932,148 @@ describe('background date sweeps', () => {
     expect(screen.queryByRole('heading', { name: /hotels and above/i })).not.toBeInTheDocument()
   })
 
-  it('announces a polling failure as a date-sweep error', async () => {
-    const user = userEvent.setup()
-    api.createSweep.mockResolvedValue({ jobId: 'sweep-error', status: 'queued' })
-    api.getSweep.mockRejectedValue(new Error('polling connection lost'))
+  it('keeps a sweep active through one polling failure, clears the warning on recovery, and completes', async () => {
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-recovery', status: 'queued' })
+    api.getSweep
+      .mockRejectedValueOnce(new Error('polling connection lost'))
+      .mockResolvedValueOnce({
+        jobId: 'sweep-recovery', status: 'running', progress: { completed: 1, total: 2 },
+        partial: [], result: null, warnings: [], cancelRequested: false,
+      })
+      .mockResolvedValueOnce({
+        jobId: 'sweep-recovery',
+        status: 'completed',
+        progress: { completed: 2, total: 2 },
+        partial: [],
+        result: {
+          dates: [{ checkin: '2026-09-01', cheapestPrice: 125, location: 'Bangkok' }],
+          cheapestDate: {
+            checkin: '2026-09-01', checkout: '2026-09-06', cheapestPrice: 125, location: 'Bangkok',
+          },
+          bestDateResults: {
+            beachfront: [],
+            non_beachfront: [hotel('Recovered Sweep Winner', 'Bangkok', 125, 'recovered')],
+          },
+        },
+        warnings: [],
+        cancelRequested: false,
+      })
     await renderReady()
+    vi.useFakeTimers()
 
-    await user.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Date sweep failed: polling connection lost',
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Date sweep polling failed: polling connection lost',
     )
+    expect(screen.getByRole('button', { name: /cancel sweep/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeDisabled()
+
+    act(() => vi.advanceTimersByTime(999))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+
+    expect(api.getSweep).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByText(/1 of 2 searches complete/)).toBeInTheDocument()
+
+    await act(async () => vi.advanceTimersByTimeAsync(750))
+    expect(screen.getByRole('heading', { name: /date sweep completed/i })).toBeInTheDocument()
+    expect(screen.getByText('Recovered Sweep Winner')).toBeInTheDocument()
+  })
+
+  it('backs off repeated polling failures without overlapping or inventing a terminal state', async () => {
+    const sixthPoll = deferred()
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-backoff', status: 'queued' })
+    api.getSweep
+      .mockRejectedValueOnce(new Error('poll failure one'))
+      .mockRejectedValueOnce(new Error('poll failure two'))
+      .mockRejectedValueOnce(new Error('poll failure three'))
+      .mockRejectedValueOnce(new Error('poll failure four'))
+      .mockRejectedValueOnce(new Error('poll failure five'))
+      .mockImplementationOnce(() => sixthPoll.promise)
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+
+    act(() => vi.advanceTimersByTime(999))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    expect(api.getSweep).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('alert')).toHaveTextContent('poll failure two')
+
+    act(() => vi.advanceTimersByTime(1_999))
+    expect(api.getSweep).toHaveBeenCalledTimes(2)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    expect(api.getSweep).toHaveBeenCalledTimes(3)
+
+    await act(async () => vi.advanceTimersByTimeAsync(3_999))
+    expect(api.getSweep).toHaveBeenCalledTimes(3)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    expect(api.getSweep).toHaveBeenCalledTimes(4)
+
+    await act(async () => vi.advanceTimersByTimeAsync(7_999))
+    expect(api.getSweep).toHaveBeenCalledTimes(4)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    expect(api.getSweep).toHaveBeenCalledTimes(5)
+
+    // The retry delay is capped at eight seconds instead of growing without bound.
+    await act(async () => vi.advanceTimersByTimeAsync(7_999))
+    expect(api.getSweep).toHaveBeenCalledTimes(5)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    expect(api.getSweep).toHaveBeenCalledTimes(6)
+
+    act(() => vi.advanceTimersByTime(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(6)
+    expect(screen.getByRole('button', { name: /cancel sweep/i })).toBeEnabled()
+    expect(screen.queryByRole('heading', { name: /date sweep failed/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeDisabled()
+  })
+
+  it('lets canonical cancellation win while a polling retry is pending and clears that retry', async () => {
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-retry-cancel', status: 'queued' })
+    api.getSweep.mockRejectedValueOnce(new Error('poll temporarily unavailable'))
+    api.cancelSweep.mockResolvedValue({
+      jobId: 'sweep-retry-cancel',
+      status: 'cancelled',
+      progress: { completed: 0, total: 3 },
+      partial: [],
+      result: null,
+      warnings: [],
+      cancelRequested: true,
+    })
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    expect(screen.getByRole('alert')).toHaveTextContent('poll temporarily unavailable')
+
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+    await act(async () => {})
+
+    expect(screen.getByRole('heading', { name: /date sweep cancelled/i })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await act(async () => vi.advanceTimersByTimeAsync(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears a pending polling retry when the application unmounts', async () => {
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-retry-unmount', status: 'queued' })
+    api.getSweep.mockRejectedValueOnce(new Error('poll temporarily unavailable'))
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+
+    cleanup()
+    await act(async () => vi.advanceTimersByTimeAsync(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
   })
 
   it('announces a terminal failed snapshot as a date-sweep error', async () => {
