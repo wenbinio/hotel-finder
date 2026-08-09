@@ -173,6 +173,54 @@ def test_provider_parser_ignores_hidden_labels_and_prices_in_offer_rows():
     assert parse_provider_prices(html) == {"agoda": 185.0}
 
 
+def test_provider_parser_uses_unique_rate_mode_when_promo_comes_first():
+    html = """
+    <a href="/travel/lodging/clk?pc=promo-first">
+      <span>Agoda</span><span>Get $20 off</span><span>$220</span><span>$220</span>
+    </a>
+    """
+
+    assert parse_provider_prices(html) == {"agoda": 220.0}
+
+
+def test_provider_parser_uses_unique_rate_mode_when_promo_comes_last():
+    html = """
+    <a href="/travel/lodging/clk?pc=promo-last">
+      <span>Agoda</span><span>$220</span><span>$220</span><span>Get $20 off</span>
+    </a>
+    """
+
+    assert parse_provider_prices(html) == {"agoda": 220.0}
+
+
+def test_provider_parser_accepts_single_distinct_offer_price():
+    html = '<a href="/travel/lodging/clk?pc=single"><span>Agoda</span><span>$220</span></a>'
+
+    assert parse_provider_prices(html) == {"agoda": 220.0}
+
+
+def test_provider_parser_omits_offer_row_with_tied_distinct_prices():
+    html = """
+    <a href="/travel/lodging/clk?pc=ambiguous">
+      <span>Agoda</span><span>Get $20 off</span><span>$220</span>
+    </a>
+    """
+
+    assert parse_provider_prices(html) == {}
+
+
+def test_provider_parser_keeps_lowest_unambiguous_row_for_provider():
+    html = """
+    <a href="/travel/lodging/clk?pc=ambiguous">
+      <span>Agoda</span><span>Get $20 off</span><span>$200</span>
+    </a>
+    <a href="/travel/lodging/clk?pc=higher"><span>Agoda</span><span>$240</span></a>
+    <a href="/travel/lodging/clk?pc=lower"><span>Agoda</span><span>$220</span></a>
+    """
+
+    assert parse_provider_prices(html) == {"agoda": 220.0}
+
+
 def test_hotel_parser_skips_malformed_price_without_aborting_later_cards():
     html = """
     <div class="uaTTDe"><h2 class="BgYkof">Broken Price Hotel</h2>

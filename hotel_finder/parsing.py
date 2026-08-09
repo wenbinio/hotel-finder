@@ -2,6 +2,7 @@
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -298,6 +299,17 @@ def _valid_prices(text: str) -> list[float]:
     return prices
 
 
+def _unambiguous_offer_price(text: str) -> float | None:
+    counts = Counter(_valid_prices(text))
+    if not counts:
+        return None
+    if len(counts) == 1:
+        return next(iter(counts))
+    highest_frequency = max(counts.values())
+    modes = [price for price, frequency in counts.items() if frequency == highest_frequency]
+    return modes[0] if len(modes) == 1 else None
+
+
 def _is_google_lodging_offer(row: Any) -> bool:
     href = row.attributes.get("href", "")
     return href == GOOGLE_LODGING_CLICK_PATH or href.startswith(
@@ -312,9 +324,8 @@ def _parse_structured_provider_prices(rows: list[Any]) -> dict[str, float]:
         provider_key = _provider_key_in_offer(fragments)
         if provider_key is None:
             continue
-        prices = _valid_prices(" ".join(fragments))
-        if prices:
-            price = min(prices)
+        price = _unambiguous_offer_price(" ".join(fragments))
+        if price is not None:
             providers[provider_key] = min(price, providers.get(provider_key, price))
     return providers
 
