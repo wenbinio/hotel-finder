@@ -14,6 +14,8 @@ const POLL_RETRY_BASE_MS = 1_000
 const POLL_RETRY_MAX_MS = 8_000
 const ACTIVE_SWEEP_STATUSES = new Set(['queued', 'running'])
 const TERMINAL_SWEEP_STATUSES = new Set(['cancelled', 'completed', 'failed'])
+const RETRYABLE_POLL_STATUSES = new Set([408, 425, 429])
+const PERMANENT_POLL_CODES = new Set(['sweep_not_found'])
 
 function isAbort(error) {
   return error?.name === 'AbortError'
@@ -21,6 +23,31 @@ function isAbort(error) {
 
 function messageFor(error) {
   return error?.message || 'An unexpected error occurred'
+}
+
+function pollErrorStatus(error) {
+  const status = Number(error?.status)
+  return Number.isInteger(status) && status >= 0 ? status : null
+}
+
+function isRetryablePollError(error) {
+  const status = pollErrorStatus(error)
+  const code = typeof error?.code === 'string' ? error.code : ''
+  if (PERMANENT_POLL_CODES.has(code)) return false
+  if (status !== null && status >= 400 && status < 500) {
+    return RETRYABLE_POLL_STATUSES.has(status)
+  }
+  if (status === 0 || (status !== null && status >= 500 && status < 600)) return true
+  return code === 'network_error' || code === 'invalid_response'
+}
+
+function pollFailureMessage(error) {
+  const details = []
+  if (typeof error?.code === 'string' && error.code) details.push(error.code)
+  const status = pollErrorStatus(error)
+  if (status !== null && status > 0) details.push(`HTTP ${status}`)
+  const message = messageFor(error)
+  return details.length ? `${message} (${details.join('; ')})` : message
 }
 
 function warningText(warning) {
@@ -313,6 +340,22 @@ export default function App() {
     }
   }, [applySweepResult, beginCancellation, beginSweep, clearPollTimer, resetPollFailures])
 
+  const finishPermanentPollFailure = useCallback((jobId, pollError) => {
+    clearPollTimer()
+    cancellationInFlight.current = null
+    cancellationObserved.current = null
+    pollRetryAfterCancellation.current = null
+    resetPollFailures(null)
+    abortCurrent(beginSweep)
+    abortCurrent(beginCancellation)
+    setSweepJob(previous => {
+      if (!previous || (previous.jobId && previous.jobId !== jobId)) return previous
+      if (TERMINAL_SWEEP_STATUSES.has(previous.status)) return previous
+      return { ...previous, status: 'failed' }
+    })
+    setError({ operation: 'Date sweep polling', message: pollFailureMessage(pollError) })
+  }, [beginCancellation, beginSweep, clearPollTimer, resetPollFailures])
+
   const pollSweep = useCallback(async (jobId, request) => {
     try {
       const snapshot = await getSweep(jobId, request.signal)
@@ -331,15 +374,25 @@ export default function App() {
       else request.finish()
     } catch (pollError) {
       if (!request.isCurrent() || isAbort(pollError)) return
+      if (!isRetryablePollError(pollError)) {
+        finishPermanentPollFailure(jobId, pollError)
+        return
+      }
       const retryDelay = nextPollRetryDelay(jobId)
-      setError({ operation: 'Date sweep polling', message: messageFor(pollError) })
+      setError({ operation: 'Date sweep polling', message: pollFailureMessage(pollError) })
       if (cancellationInFlight.current === jobId) {
         pollRetryAfterCancellation.current = { jobId, request, delay: POLL_DELAY_MS }
         return
       }
       scheduleSweepPoll(jobId, request, retryDelay)
     }
-  }, [finishTerminalSweep, nextPollRetryDelay, resetPollFailures, scheduleSweepPoll])
+  }, [
+    finishPermanentPollFailure,
+    finishTerminalSweep,
+    nextPollRetryDelay,
+    resetPollFailures,
+    scheduleSweepPoll,
+  ])
 
   useEffect(() => {
     pollSweepRef.current = pollSweep

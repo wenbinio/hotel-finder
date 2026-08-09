@@ -28,6 +28,14 @@ function deferred() {
   return { promise, reject, resolve }
 }
 
+function requestError(message, { status = 0, code = 'network_error' } = {}) {
+  const error = new Error(message)
+  error.name = 'ApiError'
+  error.status = status
+  error.code = code
+  return error
+}
+
 function hotel(name, location, price, slug) {
   return {
     name,
@@ -653,7 +661,7 @@ describe('background date sweeps', () => {
     await act(async () => {})
     fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
 
-    await act(async () => poll.reject(new Error('poll connection lost')))
+    await act(async () => poll.reject(requestError('poll connection lost')))
     expect(screen.queryByRole('heading', { name: /date sweep failed/i })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /search all destinations/i })).toBeDisabled()
 
@@ -694,7 +702,7 @@ describe('background date sweeps', () => {
     fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
     await act(async () => {})
     fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
-    await act(async () => firstPoll.reject(new Error('poll connection lost')))
+    await act(async () => firstPoll.reject(requestError('poll connection lost')))
 
     await act(async () => cancellation.resolve({
       jobId: 'sweep-poll-error-running', status: 'running', cancelRequested: true,
@@ -935,7 +943,7 @@ describe('background date sweeps', () => {
   it('keeps a sweep active through one polling failure, clears the warning on recovery, and completes', async () => {
     api.createSweep.mockResolvedValue({ jobId: 'sweep-recovery', status: 'queued' })
     api.getSweep
-      .mockRejectedValueOnce(new Error('polling connection lost'))
+      .mockRejectedValueOnce(requestError('polling connection lost'))
       .mockResolvedValueOnce({
         jobId: 'sweep-recovery', status: 'running', progress: { completed: 1, total: 2 },
         partial: [], result: null, warnings: [], cancelRequested: false,
@@ -983,15 +991,135 @@ describe('background date sweeps', () => {
     expect(screen.getByText('Recovered Sweep Winner')).toBeInTheDocument()
   })
 
+  it('terminalizes one or repeated 404 responses without retrying an absent sweep', async () => {
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-gone', status: 'queued' })
+    api.getSweep.mockRejectedValue(requestError('Sweep job no longer exists', {
+      status: 404,
+      code: 'sweep_not_found',
+    }))
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+
+    expect(screen.getByRole('heading', { name: /date sweep failed/i })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Date sweep polling failed: Sweep job no longer exists (sweep_not_found; HTTP 404)',
+    )
+    expect(screen.queryByRole('button', { name: /cancel sweep/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeEnabled()
+
+    await act(async () => vi.advanceTimersByTimeAsync(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats a sweep_not_found code as permanent even when no HTTP status is available', async () => {
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-code-gone', status: 'queued' })
+    api.getSweep.mockRejectedValue(requestError('Sweep is no longer available', {
+      status: 0,
+      code: 'sweep_not_found',
+    }))
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+
+    expect(screen.getByRole('heading', { name: /date sweep failed/i })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Date sweep polling failed: Sweep is no longer available (sweep_not_found)',
+    )
+    await act(async () => vi.advanceTimersByTimeAsync(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    [401, 'authentication_required'],
+    [403, 'forbidden'],
+  ])('terminalizes permanent HTTP %s polling errors', async (status, code) => {
+    api.createSweep.mockResolvedValue({ jobId: `sweep-${status}`, status: 'queued' })
+    api.getSweep.mockRejectedValue(requestError(`Polling rejected with ${status}`, { status, code }))
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+
+    expect(screen.getByRole('heading', { name: /date sweep failed/i })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(`(${code}; HTTP ${status})`)
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeEnabled()
+    await act(async () => vi.advanceTimersByTimeAsync(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    [429, 'rate_limited'],
+    [500, 'upstream_error'],
+    [200, 'invalid_response'],
+  ])('retries retryable HTTP %s/%s polling failures', async (status, code) => {
+    const retry = deferred()
+    api.createSweep.mockResolvedValue({ jobId: `sweep-retry-${status}`, status: 'queued' })
+    api.getSweep
+      .mockRejectedValueOnce(requestError(`Retryable ${status}`, { status, code }))
+      .mockImplementationOnce(() => retry.promise)
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+
+    expect(screen.getByRole('button', { name: /cancel sweep/i })).toBeEnabled()
+    act(() => vi.advanceTimersByTime(999))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    expect(api.getSweep).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('heading', { name: /date sweep failed/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps a permanent GET failure when a slower DELETE later resolves nonterminal', async () => {
+    const poll = deferred()
+    const cancellation = deferred()
+    api.createSweep.mockResolvedValue({ jobId: 'sweep-gone-race', status: 'queued' })
+    api.getSweep.mockImplementation(() => poll.promise)
+    api.cancelSweep.mockImplementation(() => cancellation.promise)
+    await renderReady()
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: /find cheapest dates/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /cancel sweep/i }))
+    const cancellationSignal = api.cancelSweep.mock.calls[0][1]
+
+    await act(async () => poll.reject(requestError('Sweep expired', {
+      status: 404,
+      code: 'sweep_not_found',
+    })))
+
+    expect(screen.getByRole('heading', { name: /date sweep failed/i })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Sweep expired')
+    expect(cancellationSignal.aborted).toBe(true)
+
+    await act(async () => cancellation.resolve({
+      jobId: 'sweep-gone-race', status: 'running', cancelRequested: true,
+    }))
+
+    expect(screen.getByRole('heading', { name: /date sweep failed/i })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Sweep expired')
+    expect(screen.getByRole('button', { name: /search all destinations/i })).toBeEnabled()
+    await act(async () => vi.advanceTimersByTimeAsync(30_000))
+    expect(api.getSweep).toHaveBeenCalledTimes(1)
+  })
+
   it('backs off repeated polling failures without overlapping or inventing a terminal state', async () => {
     const sixthPoll = deferred()
     api.createSweep.mockResolvedValue({ jobId: 'sweep-backoff', status: 'queued' })
     api.getSweep
-      .mockRejectedValueOnce(new Error('poll failure one'))
-      .mockRejectedValueOnce(new Error('poll failure two'))
-      .mockRejectedValueOnce(new Error('poll failure three'))
-      .mockRejectedValueOnce(new Error('poll failure four'))
-      .mockRejectedValueOnce(new Error('poll failure five'))
+      .mockRejectedValueOnce(requestError('poll failure one'))
+      .mockRejectedValueOnce(requestError('poll failure two'))
+      .mockRejectedValueOnce(requestError('poll failure three'))
+      .mockRejectedValueOnce(requestError('poll failure four'))
+      .mockRejectedValueOnce(requestError('poll failure five'))
       .mockImplementationOnce(() => sixthPoll.promise)
     await renderReady()
     vi.useFakeTimers()
@@ -1035,7 +1163,7 @@ describe('background date sweeps', () => {
 
   it('lets canonical cancellation win while a polling retry is pending and clears that retry', async () => {
     api.createSweep.mockResolvedValue({ jobId: 'sweep-retry-cancel', status: 'queued' })
-    api.getSweep.mockRejectedValueOnce(new Error('poll temporarily unavailable'))
+    api.getSweep.mockRejectedValueOnce(requestError('poll temporarily unavailable'))
     api.cancelSweep.mockResolvedValue({
       jobId: 'sweep-retry-cancel',
       status: 'cancelled',
@@ -1063,7 +1191,7 @@ describe('background date sweeps', () => {
 
   it('clears a pending polling retry when the application unmounts', async () => {
     api.createSweep.mockResolvedValue({ jobId: 'sweep-retry-unmount', status: 'queued' })
-    api.getSweep.mockRejectedValueOnce(new Error('poll temporarily unavailable'))
+    api.getSweep.mockRejectedValueOnce(requestError('poll temporarily unavailable'))
     await renderReady()
     vi.useFakeTimers()
 
